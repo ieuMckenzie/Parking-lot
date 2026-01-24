@@ -9,6 +9,7 @@ import re
 import warnings 
 import threading
 import queue
+import itertools 
 from difflib import SequenceMatcher
 
 import cv2
@@ -19,12 +20,12 @@ from ultralytics import YOLO
 # --- CONFIGURATION ---
 warnings.filterwarnings("ignore") 
 
-# STRICTNESS SETTINGS
 SIMILARITY_THRESH = 0.60  
-OCR_THRESH = 0.80        
+OCR_THRESH = 0.80           
 LOG_COOLDOWN = 60.0       
 PLATE_REGEX = r'^[A-Z0-9]{5,8}$' 
-TARGET_CLASS_NAME = 'license_plate' 
+AUTHORIZED_FILE = 'authorized.txt'
+STABILITY_VOTES_REQUIRED = 10
 
 # --- ARGUMENTS ---
 parser = argparse.ArgumentParser()
@@ -53,28 +54,81 @@ reader = easyocr.Reader(['en'], gpu=True)
 
 log_filename = 'parking_log.csv'
 seen_plates = {} 
+plate_votes = {} 
+authorized_plates = set() 
+last_auth_update = 0
+
+# --- TEXT FILE LOADING ---
+def update_authorized_list():
+    global last_auth_update, authorized_plates
+    if time.time() - last_auth_update > 5:
+        if os.path.exists(AUTHORIZED_FILE):
+            try:
+                with open(AUTHORIZED_FILE, 'r') as f:
+                    new_set = {line.strip().upper() for line in f if line.strip()}
+                if new_set != authorized_plates:
+                    print(f"🔄 Reloaded Authorized List: {len(new_set)} plates.")
+                    authorized_plates = new_set
+            except Exception as e:
+                print(f"Error reading text file: {e}")
+        last_auth_update = time.time()
+
+def is_authorized(plate):
+    return plate in authorized_plates
+
+# --- SMART CORRECTION (B/8 and Q/O) ---
+def smart_correction(text):
+    """
+    Tries swapping B/8 and Q/O to see if a valid authorized plate exists.
+    """
+    if is_authorized(text):
+        return text
+
+    # Define the confusing pairs
+    confusables = {
+        'B': '8', '8': 'B',
+        'Q': 'O', 'O': 'Q' 
+    }
+    
+    indices = [i for i, char in enumerate(text) if char in confusables]
+    
+    if not indices:
+        return text
+        
+    chars = list(text)
+    options = [[c, confusables[c]] for c in [text[i] for i in indices]]
+    
+    # Check every possible combination
+    for combo in itertools.product(*options):
+        for i, idx in enumerate(indices):
+            chars[idx] = combo[i]
+        candidate = "".join(chars)
+        
+        if is_authorized(candidate):
+            return candidate
+
+    return text
 
 # --- THREADING SETUP ---
-# The Queue acts as a "mailbox" between the Video Loop and the OCR Worker
-ocr_queue = queue.Queue(maxsize=1) # Only hold 1 pending image to prevent lag buildup
-current_display_text = {} # Shared variable to display text on screen { 'box_id': 'TEXT' }
+ocr_queue = queue.Queue(maxsize=1) 
+current_display_text = {} 
 
 if not os.path.exists(log_filename):
     with open(log_filename, 'w', newline='') as f:
-        csv.writer(f).writerow(['Timestamp', 'License_Plate', 'OCR_Confidence', 'YOLO_Confidence'])
+        csv.writer(f).writerow(['Timestamp', 'License_Plate', 'Status', 'OCR_Confidence'])
 
 # --- HELPER FUNCTIONS ---
 def preprocess_for_ocr(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape
+    
     if width < 300:
         gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_LANCZOS4)
     
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
     gray = clahe.apply(gray)
+    
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel = np.ones((2,2), np.uint8)
-    thresh = cv2.dilate(thresh, kernel, iterations=1)
     
     h, w = thresh.shape
     border = 30 
@@ -97,39 +151,96 @@ def is_similar_to_recent(new_text, current_time):
 def ocr_worker():
     while True:
         try:
-            # Wait for an image from the main loop
+            update_authorized_list()
+
             data = ocr_queue.get(timeout=1) 
             img_crop, conf_yolo, box_id = data
             
             processed_plate = preprocess_for_ocr(img_crop)
-            ocr_results = reader.readtext(processed_plate, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
             
-            found_valid = False
+            ocr_results = reader.readtext(processed_plate, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789')
+            
             for _, text, ocr_conf in ocr_results:
-                clean_plate = clean_text(text)
+                raw_plate = clean_text(text)
                 
-                if not re.match(PLATE_REGEX, clean_plate): continue
+                if not re.match(PLATE_REGEX, raw_plate): continue
                 if ocr_conf < OCR_THRESH: continue
+                
+                # --- APPLY SMART CORRECTION ---
+                clean_plate = smart_correction(raw_plate)
                 
                 current_time = time.time()
                 is_duplicate, match_name = is_similar_to_recent(clean_plate, current_time)
                 
-                if is_duplicate:
-                    seen_plates[match_name] = current_time
-                    # Update display to show we know this car
-                    current_display_text[box_id] = (match_name, (0, 255, 255)) # Yellow
+                if is_authorized(clean_plate):
+                    auth_status = "AUTHORIZED"
+                    display_color = (0, 255, 0) 
                 else:
-                    # New log
+                    auth_status = "UNAUTHORIZED"
+                    display_color = (0, 0, 255) 
+                
+                display_text = f"{clean_plate} ({auth_status[:4]})"
+
+                if is_duplicate:
+                    # --- STABILITY CHECK ---
+                    if clean_plate == match_name:
+                        if match_name in plate_votes:
+                            plate_votes[match_name].clear()
+                    else:
+                        if match_name not in plate_votes:
+                            plate_votes[match_name] = {}
+                        
+                        plate_votes[match_name][clean_plate] = plate_votes[match_name].get(clean_plate, 0) + 1
+                        
+                        if plate_votes[match_name][clean_plate] >= STABILITY_VOTES_REQUIRED:
+                            print(f"🔄 CORRECTION: Replacing '{match_name}' with '{clean_plate}' (Seen 10x)")
+                            
+                            del seen_plates[match_name]
+                            seen_plates[clean_plate] = current_time
+                            del plate_votes[match_name]
+                            
+                            match_name = clean_plate 
+                            if is_authorized(clean_plate):
+                                auth_status = "AUTHORIZED"
+                                display_color = (0, 255, 0)
+                            else:
+                                auth_status = "UNAUTHORIZED"
+                                display_color = (0, 0, 255)
+                            
+                            timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            with open(log_filename, 'a', newline='') as f:
+                                csv.writer(f).writerow([
+                                    timestamp_str, 
+                                    clean_plate, 
+                                    f"{auth_status} (CORRECTED)", 
+                                    f"{ocr_conf:.2f}"
+                                ])
+                            print(f"📝 LOG UPDATED: {clean_plate}")
+
+                            display_text = f"{clean_plate} ({auth_status[:4]})"
+                            current_display_text[box_id] = (display_text, display_color)
+
+                    seen_plates[match_name] = current_time
+                    current_display_text[box_id] = (f"{match_name} ({auth_status[:4]})", display_color)
+
+                else:
+                    # New Plate
                     timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     with open(log_filename, 'a', newline='') as f:
-                        csv.writer(f).writerow([timestamp_str, clean_plate, ocr_conf, conf_yolo])
-                    print(f"✅ LOGGED: {clean_plate} (Conf: {ocr_conf:.2f})")
+                        csv.writer(f).writerow([
+                            timestamp_str, 
+                            clean_plate, 
+                            auth_status, 
+                            f"{ocr_conf:.2f}"
+                        ])
+                    
+                    log_icon = "✅" if auth_status == "AUTHORIZED" else "⚠️"
+                    print(f"{log_icon} LOGGED: {clean_plate} [{auth_status}]")
+                    
                     seen_plates[clean_plate] = current_time
-                    # Update display to show success
-                    current_display_text[box_id] = (clean_plate, (0, 255, 0)) # Green
+                    current_display_text[box_id] = (display_text, display_color)
                 
-                found_valid = True
-                break # Only take the best read
+                break 
             
             ocr_queue.task_done()
             
@@ -138,7 +249,7 @@ def ocr_worker():
         except Exception as e:
             print(f"OCR Error: {e}")
 
-# Start the background thread
+# Start thread
 t = threading.Thread(target=ocr_worker, daemon=True)
 t.start()
 
@@ -205,19 +316,14 @@ while True:
 
         if conf > min_thresh:
             if 'plate' in classname.lower():
-                # Define a unique ID for this box detection (rough approximation)
-                # We use coordinates to match the display text to the box
                 box_id = f"{xmin}_{ymin}"
                 
-                # Check if we already have a result for this box from the thread
                 if box_id in current_display_text:
                     text_label, color = current_display_text[box_id]
                 else:
                     text_label = "Scanning..."
-                    color = (255, 100, 0) # Blue/Orange waiting color
+                    color = (255, 100, 0) # Orange waiting
                     
-                    # If queue is empty, send this plate to be read
-                    # We check full() to ensure we don't lag the video by stacking 100 images
                     if not ocr_queue.full():
                         h_img, w_img, _ = frame.shape
                         pad_x = int((xmax - xmin) * 0.08)
@@ -227,21 +333,17 @@ while True:
                         crop_xmax = min(w_img, xmax + pad_x)
                         crop_ymax = min(h_img, ymax + pad_y)
                         
-                        plate_crop = frame[crop_ymin:crop_ymax, crop_xmin:crop_xmax].copy() # .copy() is crucial for threads
+                        plate_crop = frame[crop_ymin:crop_ymax, crop_xmin:crop_xmax].copy()
                         
                         if plate_crop.size > 0:
-                            # Send to background thread!
                             ocr_queue.put((plate_crop, conf, box_id))
 
-                # Draw Box & Text
                 cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
                 cv2.putText(frame, text_label, (xmin, ymin-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             else:
-                # Other objects (not plates)
                 color = bbox_colors[classidx % 5]
                 cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
 
-    # Clean up old IDs from display dict to save RAM (Simple cleanup every 100 frames)
     if img_count % 100 == 0:
         current_display_text.clear()
 
