@@ -16,7 +16,11 @@ import cv2
 import numpy as np
 import easyocr
 from ultralytics import YOLO
+''''
+to run with multiple cameras use
+python yolo_detect.py --model my_model.pt --source usb0,usb1 
 
+'''
 # --- CONFIGURATION ---
 warnings.filterwarnings("ignore") 
 
@@ -30,17 +34,19 @@ STABILITY_VOTES_REQUIRED = 10
 # --- ARGUMENTS ---
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', help='Path to YOLO model file', required=True)
-parser.add_argument('--source', help='Image source', required=True)
+parser.add_argument('--source', help='Image source, separate by commas (Ex usb0,usb1)', required=True)
 parser.add_argument('--thresh', help='Confidence threshold', default=0.5)
 parser.add_argument('--resolution', help='Resolution WxH', default=None)
 parser.add_argument('--record', help='Record video', action='store_true')
 args = parser.parse_args()
 
 model_path = args.model
-img_source = args.source
+img_source = [s.strip() for s in args.source.split(',') if s.strip()]
 min_thresh = float(args.thresh)
 user_res = args.resolution
 record = args.record
+
+multi_cam = len(img_source) > 1
 
 # --- INITIALIZATION ---
 if not os.path.exists(model_path):
@@ -110,7 +116,7 @@ def smart_correction(text):
     return text
 
 # --- THREADING SETUP ---
-ocr_queue = queue.Queue(maxsize=1) 
+ocr_queue = queue.Queue(maxsize=4) 
 current_display_text = {} 
 
 if not os.path.exists(log_filename):
@@ -154,8 +160,8 @@ def ocr_worker():
             update_authorized_list()
 
             data = ocr_queue.get(timeout=1) 
-            img_crop, conf_yolo, box_id = data
-            
+            cam_id, img_crop, conf_yolo, box_id = data
+
             processed_plate = preprocess_for_ocr(img_crop)
             
             ocr_results = reader.readtext(processed_plate, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ123456789')
@@ -180,7 +186,7 @@ def ocr_worker():
                     display_color = (0, 0, 255) 
                 
                 display_text = f"{clean_plate} ({auth_status[:4]})"
-
+                key = (cam_id, box_id)
                 if is_duplicate:
                     # --- STABILITY CHECK ---
                     if clean_plate == match_name:
@@ -218,10 +224,10 @@ def ocr_worker():
                             print(f"📝 LOG UPDATED: {clean_plate}")
 
                             display_text = f"{clean_plate} ({auth_status[:4]})"
-                            current_display_text[box_id] = (display_text, display_color)
+                            current_display_text[key] = (display_text, display_color)
 
                     seen_plates[match_name] = current_time
-                    current_display_text[box_id] = (f"{match_name} ({auth_status[:4]})", display_color)
+                    current_display_text[key] = (f"{match_name} ({auth_status[:4]})", display_color)
 
                 else:
                     # New Plate
@@ -238,7 +244,7 @@ def ocr_worker():
                     print(f"{log_icon} LOGGED: {clean_plate} [{auth_status}]")
                     
                     seen_plates[clean_plate] = current_time
-                    current_display_text[box_id] = (display_text, display_color)
+                    current_display_text[key] = (display_text, display_color)
                 
                 break 
             
@@ -257,27 +263,44 @@ t.start()
 img_ext_list = ['.jpg','.jpeg','.png','.bmp']
 vid_ext_list = ['.avi','.mov','.mp4','.mkv']
 
-if os.path.isdir(img_source):
-    source_type = 'folder'
-    imgs_list = [f for f in glob.glob(img_source + '/*') if os.path.splitext(f)[1] in img_ext_list]
-elif os.path.isfile(img_source):
-    _, ext = os.path.splitext(img_source)
-    if ext in img_ext_list: source_type = 'image'; imgs_list = [img_source]
-    elif ext in vid_ext_list: source_type = 'video'; cap = cv2.VideoCapture(img_source)
-elif 'usb' in img_source:
-    source_type = 'usb'
-    cap = cv2.VideoCapture(int(img_source[3:]))
-elif 'picamera' in img_source:
-    source_type = 'picamera'
-    from picamera2 import Picamera2
-    cap = Picamera2()
-    cap.configure(cap.create_video_configuration(main={"format": 'RGB888', "size": (int(user_res.split('x')[0]), int(user_res.split('x')[1]))}))
-    cap.start()
+cap = None
+capture = []
+
+if not multi_cam:
+    s = img_source[0]
+    if os.path.isdir(s):
+        source_type = 'folder'
+        imgs_list = [f for f in glob.glob(s + '/*') if os.path.splitext(f)[1] in img_ext_list]
+    elif os.path.isfile(s):
+        _, ext = os.path.splitext(s)
+        if ext in img_ext_list: source_type = 'image'; imgs_list = [s]
+        elif ext in vid_ext_list: source_type = 'video'; cap = cv2.VideoCapture(s)
+    elif 'usb' in s:
+        source_type = 'usb'
+        cap = cv2.VideoCapture(int(s[3:]))
+    elif 'picamera' in s:
+        source_type = 'picamera'
+        from picamera2 import Picamera2
+        cap = Picamera2()
+        cap.configure(cap.create_video_configuration(main={"format": 'RGB888', "size": (int(user_res.split('x')[0]), int(user_res.split('x')[1]))}))
+        cap.start()
+    else:
+        sys.exit("Error: source not found")
+else:
+    source_type = "multi_usb"
+    for s in img_source:
+        if 'usb' not in s:
+            sys.exit("error: sources not found")    
+        capture.append(cv2.VideoCapture(int(s[3:])))
 
 if user_res:
     resW, resH = map(int, user_res.split('x'))
-    if source_type in ['video', 'usb']: cap.set(3, resW); cap.set(4, resH)
     resize = True
+    if source_type in ['video', 'usb']: cap.set(3, resW); cap.set(4, resH)
+    elif source_type == "multi_usb":
+        for c in capture:
+            c.set(3, resW)
+            c.set(4,resH)
 else: 
     resize = False
 
@@ -288,78 +311,148 @@ bbox_colors = [(164,120,87), (68,148,228), (93,97,209), (178,182,133), (88,159,1
 img_count = 0
 frame_rate_calc = 1
 freq = cv2.getTickFrequency()
-
+frame_counter = 0 
 # --- MAIN LOOP ---
 while True:
     t1 = cv2.getTickCount()
+    if not multi_cam:
+        if source_type in ['image', 'folder']:
+            if img_count >= len(imgs_list): break
+            frame = cv2.imread(imgs_list[img_count]); img_count += 1
+        elif source_type in ['video', 'usb']:
+            ret, frame = cap.read()
+            if not ret: break
+        elif source_type == 'picamera':
+            frame = cap.capture_array()
 
-    if source_type in ['image', 'folder']:
-        if img_count >= len(imgs_list): break
-        frame = cv2.imread(imgs_list[img_count]); img_count += 1
-    elif source_type in ['video', 'usb']:
-        ret, frame = cap.read()
-        if not ret: break
-    elif source_type == 'picamera':
-        frame = cap.capture_array()
+        if resize: frame = cv2.resize(frame, (resW, resH))
 
-    if resize: frame = cv2.resize(frame, (resW, resH))
+        results = model(frame, verbose=False)
+        detections = results[0].boxes
 
-    results = model(frame, verbose=False)
-    detections = results[0].boxes
+        for i in range(len(detections)):
+            xyxy = detections[i].xyxy.cpu().numpy().squeeze().astype(int)
+            xmin, ymin, xmax, ymax = xyxy
+            classidx = int(detections[i].cls.item())
+            classname = labels[classidx]
+            conf = detections[i].conf.item()
 
-    for i in range(len(detections)):
-        xyxy = detections[i].xyxy.cpu().numpy().squeeze().astype(int)
-        xmin, ymin, xmax, ymax = xyxy
-        classidx = int(detections[i].cls.item())
-        classname = labels[classidx]
-        conf = detections[i].conf.item()
+            if conf > min_thresh:
+                if 'plate' in classname.lower():
+                    box_id = f"{xmin}_{ymin}"
+                    key = (0, box_id)
+                    if key in current_display_text:
+                        text_label, color = current_display_text[key]
+                    else:
+                        text_label = "Scanning..."
+                        color = (255, 100, 0) # Orange waiting
+                        
+                        if not ocr_queue.full():
+                            h_img, w_img, _ = frame.shape
+                            pad_x = int((xmax - xmin) * 0.08)
+                            pad_y = int((ymax - ymin) * 0.08)
+                            crop_xmin = max(0, xmin - pad_x)
+                            crop_ymin = max(0, ymin - pad_y)
+                            crop_xmax = min(w_img, xmax + pad_x)
+                            crop_ymax = min(h_img, ymax + pad_y)
+                            
+                            plate_crop = frame[crop_ymin:crop_ymax, crop_xmin:crop_xmax].copy()
+                            
+                            if plate_crop.size > 0:
+                                ocr_queue.put((0, plate_crop, conf, box_id))
 
-        if conf > min_thresh:
-            if 'plate' in classname.lower():
-                box_id = f"{xmin}_{ymin}"
-                
-                if box_id in current_display_text:
-                    text_label, color = current_display_text[box_id]
+                    cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
+                    cv2.putText(frame, text_label, (xmin, ymin-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
                 else:
-                    text_label = "Scanning..."
-                    color = (255, 100, 0) # Orange waiting
-                    
-                    if not ocr_queue.full():
-                        h_img, w_img, _ = frame.shape
-                        pad_x = int((xmax - xmin) * 0.08)
-                        pad_y = int((ymax - ymin) * 0.08)
-                        crop_xmin = max(0, xmin - pad_x)
-                        crop_ymin = max(0, ymin - pad_y)
-                        crop_xmax = min(w_img, xmax + pad_x)
-                        crop_ymax = min(h_img, ymax + pad_y)
-                        
-                        plate_crop = frame[crop_ymin:crop_ymax, crop_xmin:crop_xmax].copy()
-                        
-                        if plate_crop.size > 0:
-                            ocr_queue.put((plate_crop, conf, box_id))
+                    color = bbox_colors[classidx % 5]
+                    cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
 
-                cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
-                cv2.putText(frame, text_label, (xmin, ymin-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            else:
-                color = bbox_colors[classidx % 5]
-                cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
+        if img_count % 100 == 0:
+            current_display_text.clear()
 
-    if img_count % 100 == 0:
-        current_display_text.clear()
+        # --- FPS CALCULATION ---
+        t2 = cv2.getTickCount()
+        time1 = (t2 - t1) / freq
+        frame_rate_calc = 1 / time1 if time1 > 0 else 0
+        
+        cv2.putText(frame, f'FPS: {frame_rate_calc:.2f}', (30, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2, cv2.LINE_AA)
 
-    # --- FPS CALCULATION ---
-    t2 = cv2.getTickCount()
-    time1 = (t2 - t1) / freq
-    frame_rate_calc = 1 / time1 if time1 > 0 else 0
-    
-    cv2.putText(frame, f'FPS: {frame_rate_calc:.2f}', (30, 50), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2, cv2.LINE_AA)
+        cv2.imshow('Parking Scanner', frame)
+        if record and recorder: recorder.write(frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
+    else:
+        any_ok = False
 
-    cv2.imshow('Parking Scanner', frame)
-    if record and recorder: recorder.write(frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'): break
+        for cam_id, cam_cap in enumerate(capture):
+            ret, frame = cam_cap.read()
+            if not ret or frame is None:
+                continue
+            any_ok = True
 
+            if resize:
+                frame = cv2.resize(frame, (resW, resH))
+
+            results = model(frame, verbose=False)
+            detections = results[0].boxes
+
+            for i in range(len(detections)):
+                xyxy = detections[i].xyxy.cpu().numpy().squeeze().astype(int)
+                xmin, ymin, xmax, ymax = xyxy
+                classidx = int(detections[i].cls.item())
+                classname = labels[classidx]
+                conf = detections[i].conf.item()
+
+                if conf > min_thresh:
+                    if 'plate' in classname.lower():
+                        box_id = f"{xmin}_{ymin}"
+                        key = (cam_id, box_id)
+
+                        if key in current_display_text:
+                            text_label, color = current_display_text[key]
+                        else:
+                            text_label = "Scanning..."
+                            color = (255, 100, 0)
+
+                            if not ocr_queue.full():
+                                h_img, w_img, _ = frame.shape
+                                pad_x = int((xmax - xmin) * 0.08)
+                                pad_y = int((ymax - ymin) * 0.08)
+                                crop_xmin = max(0, xmin - pad_x)
+                                crop_ymin = max(0, ymin - pad_y)
+                                crop_xmax = min(w_img, xmax + pad_x)
+                                crop_ymax = min(h_img, ymax + pad_y)
+
+                                plate_crop = frame[crop_ymin:crop_ymax, crop_xmin:crop_xmax].copy()
+                                if plate_crop.size > 0:
+                                    ocr_queue.put((cam_id, plate_crop, conf, box_id))
+
+                        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
+                        cv2.putText(frame, text_label, (xmin, ymin - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    else:
+                        color = bbox_colors[classidx % 5]
+                        cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
+
+            # FPS (rough, shared)
+            t2 = cv2.getTickCount()
+            time1 = (t2 - t1) / freq
+            fps = 1 / time1 if time1 > 0 else 0
+            cv2.putText(frame, f'FPS: {fps:.2f}', (30, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2, cv2.LINE_AA)
+
+            cv2.imshow(f'Parking Scanner Cam {cam_id}', frame)
+
+        frame_counter += 1
+        if frame_counter % 200 == 0:
+            current_display_text.clear()
+
+        if not any_ok:
+            break
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 if source_type in ['video', 'usb']: cap.release()
 elif source_type == 'picamera': cap.stop()
 if record and recorder: recorder.release()
-cv2.destroyAllWindows()
+cv2.destroyAllWindows() 
