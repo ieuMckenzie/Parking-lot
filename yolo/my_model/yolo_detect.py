@@ -18,7 +18,11 @@ import cv2
 import numpy as np
 import easyocr
 from ultralytics import YOLO
+''''
+to run with multiple cameras use
+python yolo_detect.py --model my_model.pt --source usb0,usb1 
 
+'''
 # --- CONFIGURATION ---
 warnings.filterwarnings("ignore")
 
@@ -48,6 +52,8 @@ record = args.record
 grid_cols = args.grid_cols
 skip_frames = max(1, args.skip_frames)
 num_ocr_workers = max(1, args.ocr_workers)
+
+multi_cam = len(img_source) > 1
 
 # --- INITIALIZATION ---
 if not os.path.exists(model_path):
@@ -420,7 +426,7 @@ def ocr_worker(worker_id):
                     display_color = (0, 0, 255)
 
                 display_text = f"{clean_plate} ({auth_status[:4]})"
-
+                key = (cam_id, box_id)
                 if is_duplicate:
                     if clean_plate == match_name:
                         shared_state.clear_plate_votes(match_name)
