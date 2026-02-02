@@ -289,14 +289,28 @@ class CameraCapture:
 
     def _try_connect(self):
         try:
-            if 'usb' in self.source_spec.lower():
-                idx = int(self.source_spec.lower().replace('usb', ''))
+            source_lower = self.source_spec.lower()
+            is_rtsp = source_lower.startswith('rtsp://')
+
+            if 'usb' in source_lower:
+                idx = int(source_lower.replace('usb', ''))
                 self.cap = cv2.VideoCapture(idx)
             elif self.source_spec.startswith('/dev/'):
                 self.cap = cv2.VideoCapture(self.source_spec)
             elif self.source_spec.isdigit():
                 self.cap = cv2.VideoCapture(int(self.source_spec))
+            elif is_rtsp:
+                # RTSP stream - use optimized settings
+                # Try FFMPEG backend with TCP transport for reliability
+                self.cap = cv2.VideoCapture(self.source_spec, cv2.CAP_FFMPEG)
+                if self.cap.isOpened():
+                    # Minimize buffer to reduce latency (get latest frame, not queued)
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    # Set a shorter timeout for faster failure detection
+                    self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+                    self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
             else:
+                # Video file or other source
                 self.cap = cv2.VideoCapture(self.source_spec)
 
             if self.cap.isOpened():
@@ -304,7 +318,8 @@ class CameraCapture:
                     self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
                     self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
                 self.connected = True
-                print(f"[{self.camera_id}] Connected to {self.source_spec}")
+                source_type = "RTSP stream" if is_rtsp else self.source_spec
+                print(f"[{self.camera_id}] Connected to {source_type}")
             else:
                 print(f"[{self.camera_id}] Failed to open {self.source_spec}")
         except Exception as e:
@@ -507,7 +522,7 @@ print(f"  Cameras: {num_cameras}")
 print(f"  Grid: {grid_display.rows}x{grid_display.cols}")
 print(f"  OCR Workers: {num_ocr_workers}")
 print(f"  Frame Skip: every {skip_frames} frame(s)")
-print(f"  Press 'q' to quit\n")
+print(f"  Controls: 's' = screenshot, 'q' = quit\n")
 
 # --- MAIN LOOP ---
 try:
@@ -585,8 +600,16 @@ try:
         if record and recorder:
             recorder.write(grid_frame)
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # Handle keyboard input
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
+        elif key == ord('s'):
+            # Screenshot
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"screenshot_{timestamp}.jpg"
+            cv2.imwrite(filename, grid_frame)
+            print(f"Screenshot saved: {filename}")
 
 finally:
     print("\nShutting down...")
