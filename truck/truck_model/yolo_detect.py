@@ -33,11 +33,11 @@ AUTHORIZED_FILE = 'authorized.txt'
 STABILITY_VOTES_REQUIRED = 10
 
 CLASS_THRESHOLDS = {
-    'dot_number': 0.50,             
-    'trailer_number': 0.60,
-    'container_number': 0.65,
-    'trailer_license_plate': 0.75,
-    'truck_license_plate': 0.75
+    'usdot': 0.50,             
+    'trailernum': 0.60,
+    'containernum': 0.65,
+    'containerplate': 0.75,
+    'licenseplate': 0.75
 }
 
 # --- ARGUMENTS ---
@@ -197,7 +197,7 @@ class CameraCapture:
         self.source_spec = source_spec
         self.resolution = resolution
         self.target_fps = target_fps
-        self.frame_interval = 1.0 / target_fps  # 0.05s for 20 FPS
+        self.frame_interval = 1.0 / target_fps
         
         self.frame_buffer = collections.deque(maxlen=1)
         self.buffer_lock = threading.Lock()
@@ -205,6 +205,8 @@ class CameraCapture:
         self.cap = None
         self.fps = 0.0
         self.last_frame_time = 0
+        # NEW: Track connection status
+        self.is_connected = False 
 
     def start(self):
         self.running = True
@@ -216,35 +218,30 @@ class CameraCapture:
 
     def _capture_loop(self):
         last_saved_time = 0
-        
         while self.running:
             if not self.cap or not self.cap.isOpened():
+                self.is_connected = False # Reset flag if connection drops
                 self._connect()
-                time.sleep(1)
+                if not self.is_connected: # Wait a bit before retrying if it failed
+                    time.sleep(1)
                 continue
 
-            # ALWAYS read the frame to clear the hardware buffer (Prevents Latency)
             ret, frame = self.cap.read()
             if not ret:
-                self.cap.release()
+                # For static images, we don't want to release and reconnect constantly
+                # We just wait a tiny bit and try to read again
+                time.sleep(0.01)
                 continue
             
             now = time.time()
-            
-            # --- FPS LIMITER LOGIC ---
-            # Only process this frame if enough time has passed (0.05s)
             if (now - last_saved_time) >= self.frame_interval:
-                
-                # Resize only the frames we keep (Saves CPU)
                 if self.resolution:
                     frame = cv2.resize(frame, self.resolution)
 
-                # Update FPS counter
                 if self.last_frame_time > 0:
                     self.fps = 1.0 / max(0.001, now - self.last_frame_time)
                 self.last_frame_time = now
 
-                # Save to buffer
                 with self.buffer_lock:
                     self.frame_buffer.append((frame, now))
                 
@@ -257,15 +254,18 @@ class CameraCapture:
             elif src.isdigit(): self.cap = cv2.VideoCapture(int(src))
             else: self.cap = cv2.VideoCapture(src)
             
-            # Try to set hardware FPS if possible (Webcams only)
             if self.cap.isOpened():
                 self.cap.set(cv2.CAP_PROP_FPS, self.target_fps) 
                 if self.resolution:
                     self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
                     self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
-            print(f"[{self.camera_id}] Connected.")
-        except: pass
-
+                
+                # ONLY print if we weren't already connected
+                if not self.is_connected:
+                    print(f"System: Loaded {self.camera_id}")
+                    self.is_connected = True
+        except: 
+            pass           
     def get_latest_frame(self):
         with self.buffer_lock:
             if self.frame_buffer: return self.frame_buffer[-1]
@@ -295,7 +295,7 @@ def yolo_worker():
                 req_conf = CLASS_THRESHOLDS.get(label_key, global_min_thresh)
                 
                 if conf > req_conf:
-                    targets = ['dot_number', 'trailer_number', 'trailer_license_plate', 'truck_license_plate', 'container_number']
+                    targets = ['usdot', 'trailernum', 'containerplate', 'licenseplate', 'containernum']
                     if any(t in label_key for t in targets):
                         detections.append({
                             'rect': (x1, y1, x2, y2),
@@ -440,10 +440,18 @@ if user_res:
     resolution = (resW, resH)
 else: resolution = (640, 480)
 
-camera_ids = [f"cam{i}" for i in range(num_cameras)]
+# --- SMART ID GENERATION ---
+camera_ids = []
+for i, src in enumerate(sources):
+    if os.path.isfile(src):
+        # Use the filename (e.g., 'truck.jpg') instead of 'cam0'
+        camera_ids.append(os.path.basename(src))
+    else:
+        # Keep 'cam0' for live USB/RTSP streams
+        camera_ids.append(f"cam{i}")
+
 cameras = {}
 for cid, src in zip(camera_ids, sources):
-    # Added target_fps=20 here
     cam = CameraCapture(cid, src, resolution, target_fps=20)
     cam.start()
     cameras[cid] = cam
