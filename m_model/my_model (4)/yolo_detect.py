@@ -23,11 +23,25 @@ from ultralytics import YOLO
 warnings.filterwarnings("ignore")
 
 SIMILARITY_THRESH = 0.60
-OCR_THRESH = 0.80
+OCR_THRESH = 0.35
 LOG_COOLDOWN = 60.0
+DETECTION_HOLD_TIME = 0.5
+# Low-res defaults: all feeds/images assumed low-res for better OCR
+OCR_MIN_HEIGHT = 220
+OCR_USE_BINARIZATION = False
+OCR_MAG_RATIO = 3.0
+OCR_BEST_EFFORT_MIN_CONF = 0.25
+# Upscale the crop before OCR (3.0 = triple size for low-res)
+OCR_UPSCALE = 3.0
+# Sharper upscaling for low-res (LANCZOS4); use INTER_CUBIC if LANCZOS4 is slow
+OCR_INTERP = cv2.INTER_LANCZOS4 if hasattr(cv2, 'INTER_LANCZOS4') else cv2.INTER_CUBIC
+# Enhance full frame (contrast + light sharpen) for clearer YOLO/OCR input
+FEED_ENHANCE = True
 
-PLATE_REGEX = r'^[A-Z0-9\-]{4,15}$' 
-CONTAINER_REGEX = r'^[A-Z]{4}[0-9]{6,7}$'
+PLATE_REGEX = r'^[A-Z0-9\-]{4,15}$'
+CONTAINER_REGEX = r'^[A-Z]{4}[0-9]{5,8}$'
+# FMCSA/49 CFR: trailer number alphanumeric, max 10 chars per trailer
+TRAILERNUM_REGEX = r'^[A-Z0-9\-]{1,10}$'
 
 AUTHORIZED_FILE = 'authorized.txt'
 STABILITY_VOTES_REQUIRED = 10
@@ -50,6 +64,9 @@ parser.add_argument('--resolution', help='Resolution WxH', default=None)
 parser.add_argument('--record', help='Record video', action='store_true')
 parser.add_argument('--grid-cols', help='Grid columns', type=int, default=None)
 parser.add_argument('--ocr-workers', help='Number of OCR threads', type=int, default=3)
+parser.add_argument('--ocr-debug', help='Print OCR diagnostics (raw results, candidates, why no match)', action='store_true')
+parser.add_argument('--ocr-upscale', help='Upscale crop by this factor before OCR (e.g. 2.0 = double size)', type=float, default=None)
+parser.add_argument('--no-enhance-feed', help='Disable frame enhancement (contrast + sharpen) for a raw feed', action='store_true')
 args = parser.parse_args()
 
 model_path = args.model
@@ -58,6 +75,11 @@ user_res = args.resolution
 record = args.record
 grid_cols = args.grid_cols
 num_ocr_workers = max(1, args.ocr_workers)
+ocr_debug = args.ocr_debug
+if args.ocr_upscale is not None:
+    OCR_UPSCALE = max(0.25, min(4.0, args.ocr_upscale))
+if args.no_enhance_feed:
+    FEED_ENHANCE = False
 sources = [s.strip() for s in args.source.split(',') if s.strip()]
 num_cameras = len(sources)
 
@@ -83,15 +105,36 @@ class SharedState:
         self._seen_plates = {}
         self._plate_votes = {}
         self._display_text = {}
-        self.latest_detections = {} 
+        self.latest_detections = {}
+        self._last_nonempty = {}
+        self._last_nonempty_time = {}
+        self._static_camera_ids = set()
+
+    def set_static_cameras(self, camera_ids, sources):
+        with self._lock:
+            self._static_camera_ids = {cid for cid, src in zip(camera_ids, sources) if os.path.isfile(src)}
 
     def update_detections(self, cam_id, detections):
         with self._lock:
+            if not detections and cam_id in self._static_camera_ids:
+                return
             self.latest_detections[cam_id] = detections
+            if detections:
+                self._last_nonempty[cam_id] = detections
+                self._last_nonempty_time[cam_id] = time.time()
 
     def get_detections(self, cam_id):
         with self._lock:
-            return self.latest_detections.get(cam_id, [])
+            det = self.latest_detections.get(cam_id, [])
+            if det:
+                return det
+            last = self._last_nonempty.get(cam_id, [])
+            if not last:
+                return []
+            t = self._last_nonempty_time.get(cam_id, 0)
+            if (time.time() - t) <= DETECTION_HOLD_TIME:
+                return last
+            return []
 
     def is_similar_to_recent(self, new_text, current_time):
         with self._lock:
@@ -195,39 +238,82 @@ def smart_correction(text):
         # Priority 1: Check Authorized List
         if is_authorized(candidate): return candidate
         
-        # Priority 2: Check Regex
-        if re.match(CONTAINER_REGEX, candidate) or re.match(PLATE_REGEX, candidate):
+        # Priority 2: Check Regex (container: strip hyphens for match)
+        if re.match(CONTAINER_REGEX, candidate.replace('-', '')) or re.match(PLATE_REGEX, candidate):
             return candidate
             
     return text
 
 # FIX: Better Preprocessing
-def preprocess_for_ocr(img):
+def preprocess_for_ocr(img, use_binarization=None):
+    if use_binarization is None:
+        use_binarization = OCR_USE_BINARIZATION
     # 1. Convert to Grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # 2. Resize: Upscale if too small
+    # 2. Resize: Upscale if too small so EasyOCR can detect each character
     height = gray.shape[0]
-    if height < 60: 
-        scale = 60 / height
-        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    if height < OCR_MIN_HEIGHT:
+        scale = OCR_MIN_HEIGHT / height
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=OCR_INTERP)
     
-    # 3. Denoise
-    gray = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+    # 3. Denoise (slightly reduced strength when using binarization)
+    gray = cv2.fastNlMeansDenoising(gray, None, 8, 7, 21)
     
     # 4. Contrast
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
     
     # 5. Sharpen
-    kernel = np.array([[0, -1, 0], [-1, 5,-1], [0, -1, 0]])
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
     gray = cv2.filter2D(gray, -1, kernel)
     
-    # 6. Padding
+    # 6. Optional binarization for plate/container text
+    if use_binarization:
+        gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    
+    # 7. Padding
     gray = cv2.copyMakeBorder(gray, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=[255, 255, 255])
     return gray
 
+def preprocess_for_ocr_light(img):
+    """Minimal preprocessing: grayscale, upscale, padding. No denoise/CLAHE/sharpen so EasyOCR sees raw contrast."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    height = gray.shape[0]
+    if height < OCR_MIN_HEIGHT:
+        scale = OCR_MIN_HEIGHT / height
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=OCR_INTERP)
+    gray = cv2.copyMakeBorder(gray, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
+    return gray
+
+def _run_readtext(processed_img):
+    return reader.readtext(
+        processed_img,
+        allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
+        decoder='greedy',
+        paragraph=False,
+        mag_ratio=OCR_MAG_RATIO,
+        adjust_contrast=0.5,
+        contrast_ths=0.1,
+        width_ths=0.6,
+        rotation_info=[90, 180, 270],
+        text_threshold=0.5,
+        low_text=0.3
+    )
+
 def clean_text(text): return re.sub(r'[^A-Z0-9\-]', '', text.upper())
+
+def enhance_frame(frame):
+    """Improve clarity: contrast (CLAHE on luminance) + light sharpen. Use on full frame before YOLO/display."""
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge([l, a, b])
+    out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    kernel = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]])
+    out = cv2.filter2D(out, -1, kernel)
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 # --- CAMERA CAPTURE CLASS ---
 class CameraCapture:
@@ -311,12 +397,19 @@ class CameraCapture:
 
 # --- YOLO WORKER ---
 yolo_input_queue = queue.Queue(maxsize=4)
+_yolo_reported = {}
+YOLO_PRINT_COOLDOWN = 5.0
 
 def yolo_worker():
+    global _yolo_reported
     print("YOLO Worker Started")
     while True:
         try:
             frame, cam_id = yolo_input_queue.get(timeout=1)
+            now = time.time()
+            for key in list(_yolo_reported.keys()):
+                if now - _yolo_reported[key] > 60:
+                    del _yolo_reported[key]
             
             results = model(frame, verbose=False)[0]
             detections = []
@@ -334,12 +427,17 @@ def yolo_worker():
                     # FIX: Targets must be lowercase now
                     targets = ['usdot', 'trailernum', 'containerplate', 'licenseplate', 'containernum']
                     if any(t in label_key for t in targets):
+                        bid = f"{x1}_{y1}"
                         detections.append({
                             'rect': (x1, y1, x2, y2),
-                            'bid': f"{x1}_{y1}",
+                            'bid': bid,
                             'label': label_key,
                             'conf': conf
                         })
+                        report_key = (cam_id, bid, label_key)
+                        if report_key not in _yolo_reported or (now - _yolo_reported[report_key]) >= YOLO_PRINT_COOLDOWN:
+                            print(f"YOLO: {label_key} {conf:.2f} ({cam_id})")
+                            _yolo_reported[report_key] = now
             
             shared_state.update_detections(cam_id, detections)
             
@@ -351,8 +449,8 @@ def yolo_worker():
                     if not ocr_queue.full():
                         h, w = frame.shape[:2]
                         x1, y1, x2, y2 = det['rect']
-                        px = int((x2-x1) * (0.15 if 'number' in det['label'] else 0.08))
-                        py = int((y2-y1) * 0.08)
+                        px = int((x2-x1) * (0.20 if 'number' in det['label'] else 0.18))
+                        py = int((y2-y1) * 0.15)
                         crop = frame[max(0, y1-py):min(h, y2+py), max(0, x1-px):min(w, x2+px)]
                         if crop.size > 0:
                             ocr_queue.put((crop, det['conf'], bid, cam_id, det['label']))
@@ -391,75 +489,155 @@ class GridDisplay:
 
 # --- OCR WORKER ---
 ocr_queue = queue.Queue(maxsize=10 * num_cameras)
+_last_ocr_error = None
+_last_ocr_error_time = 0
+OCR_ERROR_COOLDOWN = 10.0
 
 def ocr_worker(wid):
+    global _last_ocr_error, _last_ocr_error_time
     while True:
         try:
             update_authorized_list()
             data = ocr_queue.get(timeout=1)
             img_crop, conf_yolo, box_id, camera_id, class_type = data
 
+            if OCR_UPSCALE != 1.0 and OCR_UPSCALE > 0:
+                img_crop = cv2.resize(img_crop, None, fx=OCR_UPSCALE, fy=OCR_UPSCALE, interpolation=OCR_INTERP)
+
             processed = preprocess_for_ocr(img_crop)
-            
-            # Get raw details (box coordinates + text) to find vertical stacks
-            results = reader.readtext(
-                processed, 
-                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
-                decoder='greedy',
-                paragraph=False, # Keep false to get individual boxes
-                mag_ratio=1.5
-            )
+            processed_light = preprocess_for_ocr_light(img_crop)
+            results = _run_readtext(processed)
+            results_light = _run_readtext(processed_light)
+            def stitch_len(r):
+                s = ""
+                for _, text, _ in r:
+                    s += re.sub(r'[^A-Z0-9\-]', '', text.upper())
+                return len(s), sum(c for _, _, c in r) / len(r) if r else 0
+            len_full, conf_full = stitch_len(results)
+            len_light, conf_light = stitch_len(results_light)
+            if len_light > len_full or (len_light == len_full and conf_light > conf_full):
+                results = results_light
+            if not results and OCR_USE_BINARIZATION:
+                processed_no_bin = preprocess_for_ocr(img_crop, use_binarization=False)
+                results = _run_readtext(processed_no_bin)
 
-            # --- NEW: VERTICAL STITCHING LOGIC ---
-            # 1. Sort results by Y-coordinate (Top to Bottom)
-            results.sort(key=lambda x: x[0][0][1]) 
+            # --- VERTICAL STITCH: sort by Y (top to bottom) ---
+            by_y = sorted(results, key=lambda x: x[0][0][1])
+            stitched_vertical = ""
+            conf_sum = 0
+            conf_count = 0
+            for _, text, conf in by_y:
+                part = re.sub(r'[^A-Z0-9\-]', '', text.upper())
+                if part:
+                    stitched_vertical += part
+                    conf_sum += conf
+                    conf_count += 1
+            avg_conf = (conf_sum / conf_count) if conf_count > 0 else 0
 
-            stitched_text = ""
-            current_conf = 0
-            count = 0
-            
-            # 2. Naive Stitching: Just join everything found in this crop
-            # (Since YOLO already cropped the area tight, this is usually safe)
+            # --- HORIZONTAL STITCH: sort by X (left to right) ---
+            by_x = sorted(results, key=lambda x: x[0][0][0])
+            stitched_horizontal = ""
+            for _, text, _ in by_x:
+                part = re.sub(r'[^A-Z0-9\-]', '', text.upper())
+                if part:
+                    stitched_horizontal += part
+
+            # Build candidate list: stitched (vertical, horizontal) + individual lines; dedupe
+            candidates_with_conf = [(stitched_vertical, avg_conf), (stitched_horizontal, avg_conf)]
             for _, text, conf in results:
-                clean_char = re.sub(r'[^A-Z0-9]', '', text.upper())
-                if clean_char:
-                    stitched_text += clean_char
-                    current_conf += conf
-                    count += 1
-            
-            # Average confidence of the stitched parts
-            if count > 0:
-                final_conf = current_conf / count
-            else:
-                final_conf = 0
+                raw_part = re.sub(r'[^A-Z0-9\-]', '', text.upper())
+                if raw_part:
+                    candidates_with_conf.append((raw_part, conf))
+            seen = set()
+            unique_candidates = []
+            for cand, c in candidates_with_conf:
+                if cand not in seen and len(cand) >= 1:
+                    seen.add(cand)
+                    unique_candidates.append((cand, c))
 
-            # 3. Now run your existing validation on the STITCHED string
-            candidates = [stitched_text] 
-            
-            # Also keep original non-stitched results in case it was actually horizontal
-            for _, text, conf in results:
-                candidates.append(re.sub(r'[^A-Z0-9]', '', text.upper()))
+            if ocr_debug:
+                print(f"[OCR debug] {camera_id} {box_id} {class_type}: results_empty={len(results)==0}, raw_count={len(results)}")
+                for i, (bbox, text, conf) in enumerate(results):
+                    print(f"  raw[{i}] text={repr(text)} conf={conf:.2f}")
+                print(f"  stitched_vertical={repr(stitched_vertical)} stitched_horizontal={repr(stitched_horizontal)} avg_conf={avg_conf:.2f}")
+                print(f"  unique_candidates={len(unique_candidates)}")
 
             found_match = False
-            for raw in candidates:
-                if found_match: break
-                
-                # ... (Insert your existing Validation & Correction Logic here) ...
-                
-                # TEST: Vertical Container Regex (Standard format still applies once stitched)
+            final_text = None
+            final_conf = 0
+            regex_valid_candidates = []
+            for raw, cand_conf in unique_candidates:
+                cleaned = clean_text(raw)
+                if not cleaned:
+                    if ocr_debug:
+                        print(f"  candidate {repr(raw)} -> cleaned empty, skip")
+                    continue
+                corrected = smart_correction(cleaned)
                 is_valid = False
-                if 'container' in class_type:
-                    if re.match(CONTAINER_REGEX, raw): is_valid = True
-                elif 'plate' in class_type:
-                    if re.match(PLATE_REGEX, raw): is_valid = True
-                
-                if is_valid and final_conf >= OCR_THRESH:
-                    # ... (Your existing Logging/Voting Code) ...
+                if 'containernum' in class_type or ('container' in class_type and 'plate' not in class_type):
+                    norm = corrected.replace('-', '')
+                    is_valid = bool(re.match(CONTAINER_REGEX, norm))
+                elif 'trailernum' in class_type:
+                    is_valid = bool(re.match(TRAILERNUM_REGEX, corrected))
+                else:
+                    is_valid = bool(re.match(PLATE_REGEX, corrected))
+                if is_valid:
+                    regex_valid_candidates.append((corrected, cand_conf))
+                if is_valid and cand_conf >= OCR_THRESH:
                     found_match = True
-            
+                    final_text = corrected
+                    final_conf = cand_conf
+                    if ocr_debug:
+                        print(f"  ACCEPTED: corrected={corrected} conf={cand_conf:.2f} (>= OCR_THRESH)")
+                    break
+                if ocr_debug:
+                    print(f"  candidate raw={repr(raw)} cleaned={cleaned} corrected={corrected} is_valid={is_valid} conf={cand_conf:.2f}")
+
+            if not found_match and regex_valid_candidates:
+                best = max(regex_valid_candidates, key=lambda x: x[1])
+                if best[1] >= OCR_BEST_EFFORT_MIN_CONF:
+                    found_match = True
+                    final_text = best[0]
+                    final_conf = best[1]
+                    if ocr_debug:
+                        print(f"  BEST_EFFORT: corrected={final_text} conf={final_conf:.2f}")
+
+            if not found_match and ocr_debug:
+                if not results:
+                    print(f"  NO_MATCH reason: EasyOCR returned empty")
+                elif not regex_valid_candidates:
+                    print(f"  NO_MATCH reason: no candidate matched regex")
+                else:
+                    print(f"  NO_MATCH reason: best regex-valid conf {max(c[1] for c in regex_valid_candidates):.2f} < {OCR_BEST_EFFORT_MIN_CONF}")
+
+            if found_match and final_text:
+                color = (0, 255, 0) if is_authorized(final_text) else (255, 255, 255)
+                shared_state.set_display_text(camera_id, box_id, final_text, color)
+                shared_state.add_plate_vote(box_id, final_text)
+                similar, _ = shared_state.is_similar_to_recent(final_text, time.time())
+                if not similar:
+                    if 'containernum' in class_type:
+                        data_type = 'containernum'
+                    elif 'containerplate' in class_type:
+                        data_type = 'containerplate'
+                    elif 'licenseplate' in class_type:
+                        data_type = 'licenseplate'
+                    elif 'usdot' in class_type:
+                        data_type = 'usdot'
+                    elif 'trailernum' in class_type:
+                        data_type = 'trailernum'
+                    else:
+                        data_type = 'container' if 'container' in class_type else 'plate'
+                    csv_logger.log(camera_id, final_text, data_type, final_conf)
+                    shared_state.update_seen_plate(final_text, time.time())
+
             ocr_queue.task_done()
         except queue.Empty: continue
-        except Exception as e: print(f"OCR Error: {e}")
+        except Exception as e:
+            now = time.time()
+            if e != _last_ocr_error or (now - _last_ocr_error_time) >= OCR_ERROR_COOLDOWN:
+                print(f"OCR Error: {e}")
+                _last_ocr_error, _last_ocr_error_time = e, now
 
 # --- STARTUP ---
 print(f"Starting {num_ocr_workers} OCR workers...")
@@ -479,6 +657,8 @@ for i, src in enumerate(sources):
         camera_ids.append(os.path.basename(src))
     else:
         camera_ids.append(f"cam{i}")
+
+shared_state.set_static_cameras(camera_ids, sources)
 
 cameras = {}
 for cid, src in zip(camera_ids, sources):
@@ -505,6 +685,8 @@ try:
                 continue
             
             frame = f.copy()
+            if FEED_ENHANCE:
+                frame = enhance_frame(frame)
             fps_map[cid] = cam.fps
             
             if not yolo_input_queue.full():
