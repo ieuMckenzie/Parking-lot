@@ -1,11 +1,9 @@
-# Truck logistics scanner using PaddleOCR (same YOLO + pipeline as yolo_detect.py).
+# Truck logistics scanner using PaddleOCR (Optimized for Speed/Accuracy)
 # Run: python paddle_detect.py --model my_model.pt --source s3.png
-# Install: pip install paddlepaddle paddleocr
-# (Script must not be named paddle.py or it shadows the PaddlePaddle library.)
+# Install: pip install paddlepaddle paddleocr ultralytics opencv-python
 import os
 import sys
 import argparse
-import glob
 import time
 import csv
 import datetime
@@ -27,50 +25,51 @@ from ultralytics import YOLO
 warnings.filterwarnings("ignore")
 
 SIMILARITY_THRESH = 0.60
-OCR_THRESH = 0.35
+OCR_THRESH = 0.40  # Slightly higher for Paddle v4
 LOG_COOLDOWN = 60.0
 DETECTION_HOLD_TIME = 0.5
-# Low-res defaults: all feeds/images assumed low-res for better OCR
-OCR_MIN_HEIGHT = 220
+
+# OPTIMIZED DEFAULTS
+OCR_MIN_HEIGHT = 48         # Paddle expects ~32-48px height. 220 was too slow.
 OCR_USE_BINARIZATION = False
-OCR_MAG_RATIO = 3.0
-OCR_BEST_EFFORT_MIN_CONF = 0.25
-# Upscale the crop before OCR (3.0 = triple size for low-res)
-OCR_UPSCALE = 3.0
-# Sharper upscaling for low-res (LANCZOS4); use INTER_CUBIC if LANCZOS4 is slow
-OCR_INTERP = cv2.INTER_LANCZOS4 if hasattr(cv2, 'INTER_LANCZOS4') else cv2.INTER_CUBIC
-# Enhance full frame (contrast + light sharpen) for clearer YOLO/OCR input
-FEED_ENHANCE = True
+OCR_MAG_RATIO = 1.5         # 1.5x is usually sufficient for 1080p
+OCR_BEST_EFFORT_MIN_CONF = 0.30
+OCR_UPSCALE = 2.0           # 2.0x is safer than 3.0x (artifacts)
+OCR_SMALL_CROP_HEIGHT = 40
+OCR_UPSCALE_SMALL = 3.0     # Only upscale tiny crops significantly
+# INTER_LINEAR is much faster than LANCZOS4 and sufficient for OCR
+OCR_INTERP = cv2.INTER_LINEAR 
+
+FEED_ENHANCE = True         # Keep True for human visualization
 
 PLATE_REGEX = r'^[A-Z0-9\-]{4,15}$'
-CONTAINER_REGEX = r'^[A-Z]{4}[0-9]{5,8}$'
-# FMCSA/49 CFR: trailer number alphanumeric, max 10 chars per trailer
+CONTAINER_REGEX = r'^[A-Z]{4}[0-9]{6,7}$' # Standard ISO is 4 letters + 6 digits + 1 check
 TRAILERNUM_REGEX = r'^[A-Z0-9\-]{1,10}$'
 
 AUTHORIZED_FILE = 'authorized.txt'
 STABILITY_VOTES_REQUIRED = 10
 
-# FIX: Keys must be lowercase to match the logic below
+# Keys must be lowercase
 CLASS_THRESHOLDS = {
     'usdot': 0.50,             
     'trailernum': 0.60,
     'containernum': 0.40,
-    'containerplate': 0.75,
-    'licenseplate': 0.75
+    'containerplate': 0.70,
+    'licenseplate': 0.70
 }
 
 # --- ARGUMENTS ---
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', help='Path to YOLO model file', required=True)
-parser.add_argument('--source', help='Comma-separated sources', required=True)
+parser.add_argument('--source', help='Comma-separated sources (0, rtsp://..., file.mp4)', required=True)
 parser.add_argument('--thresh', help='Confidence threshold', default=0.5, type=float)
 parser.add_argument('--resolution', help='Resolution WxH', default=None)
 parser.add_argument('--record', help='Record video', action='store_true')
 parser.add_argument('--grid-cols', help='Grid columns', type=int, default=None)
-parser.add_argument('--ocr-workers', help='Number of OCR threads', type=int, default=3)
-parser.add_argument('--ocr-debug', help='Print OCR diagnostics (raw results, candidates, why no match)', action='store_true')
-parser.add_argument('--ocr-upscale', help='Upscale crop by this factor before OCR (e.g. 2.0 = double size)', type=float, default=None)
-parser.add_argument('--no-enhance-feed', help='Disable frame enhancement (contrast + sharpen) for a raw feed', action='store_true')
+parser.add_argument('--ocr-workers', help='Number of OCR threads', type=int, default=2)
+parser.add_argument('--ocr-debug', help='Print OCR diagnostics', action='store_true')
+parser.add_argument('--use-gpu', help='Enable GPU for PaddleOCR', action='store_true')
+parser.add_argument('--no-enhance-feed', help='Disable frame enhancement', action='store_true')
 args = parser.parse_args()
 
 model_path = args.model
@@ -80,8 +79,8 @@ record = args.record
 grid_cols = args.grid_cols
 num_ocr_workers = max(1, args.ocr_workers)
 ocr_debug = args.ocr_debug
-if args.ocr_upscale is not None:
-    OCR_UPSCALE = max(0.25, min(4.0, args.ocr_upscale))
+use_gpu = args.use_gpu
+
 if args.no_enhance_feed:
     FEED_ENHANCE = False
 sources = [s.strip() for s in args.source.split(',') if s.strip()]
@@ -95,7 +94,8 @@ print("Initializing YOLO...")
 model = YOLO(model_path, task='detect')
 labels = model.names
 
-print("Initializing PaddleOCR...")
+print(f"Initializing PaddleOCR (GPU={use_gpu})...")
+# PaddleOCR 3.x: only lang is supported; use_gpu/show_log/det_* are not in this API
 reader = PaddleOCR(lang='en')
 
 log_filename = 'truck_logistics.csv'
@@ -162,24 +162,11 @@ class SharedState:
             self._plate_votes[original][candidate] = self._plate_votes[original].get(candidate, 0) + 1
             return self._plate_votes[original][candidate]
 
-    def clear_plate_votes(self, plate):
-        with self._lock:
-            if plate in self._plate_votes: self._plate_votes[plate].clear()
-
-    def delete_plate_votes(self, plate):
-        with self._lock:
-            if plate in self._plate_votes: del self._plate_votes[plate]
-
     def set_display_text(self, camera_id, box_id, text, color):
         with self._lock: self._display_text[(camera_id, box_id)] = (text, color)
 
     def get_display_text(self, camera_id, box_id):
         with self._lock: return self._display_text.get((camera_id, box_id), (None, None))
-
-    def clear_display_text_for_camera(self, camera_id):
-        with self._lock:
-            keys_to_remove = [k for k in self._display_text if k[0] == camera_id]
-            for k in keys_to_remove: del self._display_text[k]
 
 shared_state = SharedState()
 
@@ -215,14 +202,12 @@ def update_authorized_list():
 
 def is_authorized(plate): return plate in authorized_plates
 
-# FIX: Expanded Smart Correction
 def smart_correction(text):
     if is_authorized(text): return text
     
-    # Expanded confusion map
     confusables = {
         'B': '8', '8': 'B',
-        'Q': 'O', 'O': 'Q', 'D': 'O', '0': 'O',
+        'Q': '0', '0': 'Q', 'D': '0', 'O': '0',
         'S': '5', '5': 'S',
         'Z': '2', '2': 'Z',
         'G': '6', '6': 'G',
@@ -235,53 +220,44 @@ def smart_correction(text):
     chars = list(text)
     options = [[c, confusables[c]] for c in [text[i] for i in indices]]
     
+    # Limit combinations to prevent freeze on long strings
+    if len(options) > 6: options = options[:6]
+
     for combo in itertools.product(*options):
         for i, idx in enumerate(indices): chars[idx] = combo[i]
         candidate = "".join(chars)
         
-        # Priority 1: Check Authorized List
         if is_authorized(candidate): return candidate
-        
-        # Priority 2: Check Regex (container: strip hyphens for match)
         if re.match(CONTAINER_REGEX, candidate.replace('-', '')) or re.match(PLATE_REGEX, candidate):
             return candidate
             
     return text
 
-# FIX: Better Preprocessing
-def preprocess_for_ocr(img, use_binarization=None):
-    if use_binarization is None:
-        use_binarization = OCR_USE_BINARIZATION
-    # 1. Convert to Grayscale
+# --- OPTIMIZED PREPROCESSING ---
+def preprocess_for_ocr(img, use_binarization=False):
+    """Heavy preprocessing for difficult images."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # 2. Resize: Upscale if too small so OCR can detect each character
     height = gray.shape[0]
     if height < OCR_MIN_HEIGHT:
         scale = OCR_MIN_HEIGHT / height
+        # INTER_LINEAR is faster
         gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=OCR_INTERP)
     
-    # 3. Denoise (slightly reduced strength when using binarization)
-    gray = cv2.fastNlMeansDenoising(gray, None, 8, 7, 21)
-    
-    # 4. Contrast
+    # REMOVED fastNlMeansDenoising (Too slow for real-time)
+
+    # Contrast
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
     
-    # 5. Sharpen
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    gray = cv2.filter2D(gray, -1, kernel)
-    
-    # 6. Optional binarization for plate/container text
     if use_binarization:
         gray = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
     
-    # 7. Padding
     gray = cv2.copyMakeBorder(gray, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=[255, 255, 255])
     return gray
 
 def preprocess_for_ocr_light(img):
-    """Minimal preprocessing: grayscale, upscale, padding. No denoise/CLAHE/sharpen so OCR sees raw contrast."""
+    """Minimal preprocessing: grayscale + resize. Best for OCR v4."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     height = gray.shape[0]
     if height < OCR_MIN_HEIGHT:
@@ -291,32 +267,111 @@ def preprocess_for_ocr_light(img):
     return gray
 
 def _run_readtext(processed_img):
-    """Run PaddleOCR and return same format as EasyOCR: list of (bbox, text, conf)."""
     if len(processed_img.shape) == 2:
         img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
     else:
         img = processed_img
-    result = reader.ocr(img, cls=True)
+    result = reader.ocr(img)
     if not result or result[0] is None:
         return []
+    r0 = result[0]
+
+    # PaddleOCR 3.x: result[0] is dict with rec_texts, rec_scores, dt_polys/rec_polys
+    def _get(key, default=None):
+        if hasattr(r0, 'get') and callable(r0.get):
+            return r0.get(key, default)
+        return getattr(r0, key, default)
+    texts = _get('rec_texts') or _get('rec_text')
+    if texts is not None:
+        if hasattr(texts, '__iter__') and not isinstance(texts, str):
+            texts = list(texts)
+        else:
+            texts = [texts] if texts else []
+        if texts:
+            scores = _get('rec_scores') or _get('rec_score')
+            if scores is None or (hasattr(scores, '__len__') and len(scores) != len(texts)):
+                scores = [0.5] * len(texts)
+            else:
+                scores = list(scores)
+            polys = _get('dt_polys') or _get('rec_polys') or _get('rec_boxes')
+            if polys is not None and hasattr(polys, '__len__') and len(polys) == len(texts):
+                polys = list(polys)
+            else:
+                polys = None
+            out = []
+            dummy = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], dtype=np.float64)
+            for i, text in enumerate(texts):
+                text = str(text).strip() if text else ""
+                if not text:
+                    continue
+                try:
+                    conf = float(scores[i]) if i < len(scores) else 0.5
+                except (ValueError, TypeError, IndexError):
+                    conf = 0.5
+                conf = max(0.0, min(1.0, conf))
+                if polys is not None and i < len(polys):
+                    try:
+                        box = np.array(polys[i], dtype=np.float64)
+                        if box.ndim == 1 and box.size >= 4:
+                            box = box.reshape(-1, 2)
+                        if box.ndim < 2 or box.size < 4:
+                            box = dummy.copy()
+                    except (ValueError, TypeError):
+                        box = dummy.copy()
+                else:
+                    box = dummy.copy()
+                out.append((box, text, conf))
+            return out
+
+    # 2.x-style list of [box, (text, conf)]
     out = []
-    for line in result[0]:
-        box, (text, conf) = line[0], line[1]
-        out.append((np.array(box), str(text).strip(), float(conf)))
+    for line in list(r0):
+        if not line or len(line) < 2:
+            continue
+        try:
+            box = np.array(line[0], dtype=np.float64)
+        except (ValueError, TypeError):
+            continue
+        if box.ndim == 1 and box.size >= 4:
+            box = box.reshape(-1, 2)
+        if box.ndim < 2 or box.size < 4:
+            continue
+        second = line[1]
+        if isinstance(second, (list, tuple)) and len(second) >= 2:
+            text = str(second[0]).strip()
+            try:
+                conf = float(second[1])
+            except (ValueError, TypeError):
+                conf = 0.5
+            conf = max(0.0, min(1.0, conf))
+        else:
+            text, conf = str(second).strip(), 0.5
+        out.append((box, text, conf))
     return out
+
+def _bbox_y0(item):
+    b = item[0]
+    try:
+        return float(b[0][1]) if getattr(b, 'ndim', 2) >= 2 and len(b) > 0 else 0.0
+    except (IndexError, TypeError):
+        return 0.0
+def _bbox_x0(item):
+    b = item[0]
+    try:
+        return float(b[0][0]) if getattr(b, 'ndim', 2) >= 2 and len(b) > 0 else 0.0
+    except (IndexError, TypeError):
+        return 0.0
 
 def clean_text(text): return re.sub(r'[^A-Z0-9\-]', '', text.upper())
 
 def enhance_frame(frame):
-    """Improve clarity: contrast (CLAHE on luminance) + light sharpen. Use on full frame before YOLO/display."""
+    """Visualization only. Does not affect OCR."""
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l = clahe.apply(l)
     lab = cv2.merge([l, a, b])
     out = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    kernel = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]])
-    out = cv2.filter2D(out, -1, kernel)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 # --- CAMERA CAPTURE CLASS ---
@@ -334,7 +389,7 @@ class CameraCapture:
         self.cap = None
         self.fps = 0.0
         self.last_frame_time = 0
-        self.is_connected = False # FIX: Prevents spamming
+        self.is_connected = False
 
     def start(self):
         self.running = True
@@ -356,8 +411,9 @@ class CameraCapture:
 
             ret, frame = self.cap.read()
             if not ret:
-                # FIX: Static files just sleep instead of release
-                time.sleep(0.01)
+                time.sleep(0.01) # Avoid busy loop on static files
+                if isinstance(self.source_spec, str) and os.path.isfile(self.source_spec):
+                     self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Loop file
                 continue
             
             now = time.time()
@@ -387,12 +443,10 @@ class CameraCapture:
                     self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
                     self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
                 
-                # FIX: Only print once
                 if not self.is_connected:
                     print(f"System: Loaded {self.camera_id}")
                     self.is_connected = True
-        except: 
-            pass           
+        except: pass           
     
     def get_latest_frame(self):
         with self.buffer_lock:
@@ -412,25 +466,24 @@ def yolo_worker():
             frame, cam_id = yolo_input_queue.get(timeout=1)
             now = time.time()
             for key in list(_yolo_reported.keys()):
-                if now - _yolo_reported[key] > 60:
-                    del _yolo_reported[key]
+                if now - _yolo_reported[key] > 60: del _yolo_reported[key]
             
-            results = model(frame, verbose=False)[0]
+            results = model(frame, verbose=False, iou=0.45)[0] # Added iou param for better NMS
             detections = []
+            
+            def _normalize_label(rl): return rl.lower().replace(' ', '').replace('_', '')
+            targets = ['usdot', 'trailernum', 'containerplate', 'licenseplate', 'containernum']
             
             for box in results.boxes:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
                 conf = box.conf.item()
                 cls_id = int(box.cls)
-                
                 raw_label = labels[cls_id] if cls_id < len(labels) else "unknown"
-                label_key = raw_label.lower().replace(' ', '_')
+                label_key = _normalize_label(raw_label)
                 req_conf = CLASS_THRESHOLDS.get(label_key, global_min_thresh)
                 
                 if conf > req_conf:
-                    # FIX: Targets must be lowercase now
-                    targets = ['usdot', 'trailernum', 'containerplate', 'licenseplate', 'containernum']
-                    if any(t in label_key for t in targets):
+                    if any(t in label_key for t in targets) or label_key in targets:
                         bid = f"{x1}_{y1}"
                         detections.append({
                             'rect': (x1, y1, x2, y2),
@@ -453,9 +506,16 @@ def yolo_worker():
                     if not ocr_queue.full():
                         h, w = frame.shape[:2]
                         x1, y1, x2, y2 = det['rect']
-                        px = int((x2-x1) * (0.20 if 'number' in det['label'] else 0.18))
-                        py = int((y2-y1) * 0.15)
+                        
+                        # Dynamic padding
+                        pad_x_pct = 0.20
+                        pad_y_pct = 0.15
+                        if det['label'] in ('licenseplate', 'containerplate'):
+                            pad_x_pct, pad_y_pct = 0.28, 0.22
+                        
+                        px, py = int((x2-x1) * pad_x_pct), int((y2-y1) * pad_y_pct)
                         crop = frame[max(0, y1-py):min(h, y2+py), max(0, x1-px):min(w, x2+px)]
+                        
                         if crop.size > 0:
                             ocr_queue.put((crop, det['conf'], bid, cam_id, det['label']))
 
@@ -482,16 +542,14 @@ class GridDisplay:
                 img = cv2.resize(frames[cam_id], self.cell_size)
                 canvas[y:y+self.cell_size[1], x:x+self.cell_size[0]] = img
                 
-                # Show FPS only if > 0 (avoids clutter on static images)
                 fps = fps_data.get(cam_id, 0)
                 fps_txt = f"{cam_id}" + (f" | FPS: {fps:.1f}" if fps > 1.0 else "")
-                
                 cv2.putText(canvas, fps_txt, (x+10, y+30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             else:
                 cv2.putText(canvas, "NO SIGNAL", (x+50, y+50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
         return canvas
 
-# --- OCR WORKER ---
+# --- OCR WORKER (OPTIMIZED FLOW) ---
 ocr_queue = queue.Queue(maxsize=10 * num_cameras)
 _last_ocr_error = None
 _last_ocr_error_time = 0
@@ -505,135 +563,88 @@ def ocr_worker(wid):
             data = ocr_queue.get(timeout=1)
             img_crop, conf_yolo, box_id, camera_id, class_type = data
 
-            if OCR_UPSCALE != 1.0 and OCR_UPSCALE > 0:
-                img_crop = cv2.resize(img_crop, None, fx=OCR_UPSCALE, fy=OCR_UPSCALE, interpolation=OCR_INTERP)
+            # Adaptive upscale
+            h_crop = img_crop.shape[0] if hasattr(img_crop, 'shape') else 0
+            upscale = OCR_UPSCALE_SMALL if (h_crop > 0 and h_crop < OCR_SMALL_CROP_HEIGHT) else OCR_UPSCALE
+            if upscale != 1.0:
+                img_crop = cv2.resize(img_crop, None, fx=upscale, fy=upscale, interpolation=OCR_INTERP)
 
-            processed = preprocess_for_ocr(img_crop)
+            def get_avg_conf(res):
+                if not res: return 0.0
+                return sum(c for _, _, c in res) / len(res)
+
+            # --- STRATEGY 1: LIGHT (Fastest) ---
             processed_light = preprocess_for_ocr_light(img_crop)
-            results = _run_readtext(processed)
-            results_light = _run_readtext(processed_light)
-            def stitch_len(r):
-                s = ""
-                for _, text, _ in r:
-                    s += re.sub(r'[^A-Z0-9\-]', '', text.upper())
-                return len(s), sum(c for _, _, c in r) / len(r) if r else 0
-            len_full, conf_full = stitch_len(results)
-            len_light, conf_light = stitch_len(results_light)
-            if len_light > len_full or (len_light == len_full and conf_light > conf_full):
-                results = results_light
-            if not results and OCR_USE_BINARIZATION:
-                processed_no_bin = preprocess_for_ocr(img_crop, use_binarization=False)
-                results = _run_readtext(processed_no_bin)
+            results = _run_readtext(processed_light)
+            avg_conf = get_avg_conf(results)
 
-            # --- VERTICAL STITCH: sort by Y (top to bottom) ---
-            by_y = sorted(results, key=lambda x: x[0][0][1])
-            stitched_vertical = ""
-            conf_sum = 0
-            conf_count = 0
-            for _, text, conf in by_y:
-                part = re.sub(r'[^A-Z0-9\-]', '', text.upper())
-                if part:
-                    stitched_vertical += part
-                    conf_sum += conf
-                    conf_count += 1
-            avg_conf = (conf_sum / conf_count) if conf_count > 0 else 0
+            # --- STRATEGY 2: HEAVY (Only if needed) ---
+            if not results or avg_conf < 0.85:
+                processed = preprocess_for_ocr(img_crop, use_binarization=False)
+                results_heavy = _run_readtext(processed)
+                if get_avg_conf(results_heavy) > avg_conf:
+                    results = results_heavy
 
-            # --- HORIZONTAL STITCH: sort by X (left to right) ---
-            by_x = sorted(results, key=lambda x: x[0][0][0])
-            stitched_horizontal = ""
-            for _, text, _ in by_x:
-                part = re.sub(r'[^A-Z0-9\-]', '', text.upper())
-                if part:
-                    stitched_horizontal += part
+            # --- STRATEGY 3: BINARY (Last resort for plates) ---
+            is_plate = class_type in ('licenseplate', 'containerplate')
+            if is_plate and (not results or get_avg_conf(results) < 0.60):
+                processed_bin = preprocess_for_ocr(img_crop, use_binarization=True)
+                results_bin = _run_readtext(processed_bin)
+                if get_avg_conf(results_bin) > get_avg_conf(results):
+                    results = results_bin
 
-            # Build candidate list: stitched (vertical, horizontal) + individual lines; dedupe
-            candidates_with_conf = [(stitched_vertical, avg_conf), (stitched_horizontal, avg_conf)]
+            # --- STITCHING & MATCHING ---
+            # Sort vertically then horizontally
+            by_y = sorted(results, key=_bbox_y0)
+            stitched = ""
+            for _, text, _ in by_y:
+                stitched += re.sub(r'[^A-Z0-9\-]', '', text.upper())
+
+            candidates = [(stitched, get_avg_conf(results))]
             for _, text, conf in results:
-                raw_part = re.sub(r'[^A-Z0-9\-]', '', text.upper())
-                if raw_part:
-                    candidates_with_conf.append((raw_part, conf))
-            seen = set()
-            unique_candidates = []
-            for cand, c in candidates_with_conf:
-                if cand not in seen and len(cand) >= 1:
-                    seen.add(cand)
-                    unique_candidates.append((cand, c))
-
-            if ocr_debug:
-                print(f"[OCR debug] {camera_id} {box_id} {class_type}: results_empty={len(results)==0}, raw_count={len(results)}")
-                for i, (bbox, text, conf) in enumerate(results):
-                    print(f"  raw[{i}] text={repr(text)} conf={conf:.2f}")
-                print(f"  stitched_vertical={repr(stitched_vertical)} stitched_horizontal={repr(stitched_horizontal)} avg_conf={avg_conf:.2f}")
-                print(f"  unique_candidates={len(unique_candidates)}")
+                candidates.append((re.sub(r'[^A-Z0-9\-]', '', text.upper()), conf))
 
             found_match = False
             final_text = None
             final_conf = 0
-            regex_valid_candidates = []
-            for raw, cand_conf in unique_candidates:
-                cleaned = clean_text(raw)
-                if not cleaned:
-                    if ocr_debug:
-                        print(f"  candidate {repr(raw)} -> cleaned empty, skip")
-                    continue
-                corrected = smart_correction(cleaned)
+            
+            for raw, cand_conf in candidates:
+                if not raw: continue
+                corrected = smart_correction(raw)
+                
                 is_valid = False
                 if 'containernum' in class_type or ('container' in class_type and 'plate' not in class_type):
-                    norm = corrected.replace('-', '')
-                    is_valid = bool(re.match(CONTAINER_REGEX, norm))
+                    is_valid = bool(re.match(CONTAINER_REGEX, corrected.replace('-', '')))
                 elif 'trailernum' in class_type:
                     is_valid = bool(re.match(TRAILERNUM_REGEX, corrected))
                 else:
                     is_valid = bool(re.match(PLATE_REGEX, corrected))
-                if is_valid:
-                    regex_valid_candidates.append((corrected, cand_conf))
+                
                 if is_valid and cand_conf >= OCR_THRESH:
                     found_match = True
                     final_text = corrected
                     final_conf = cand_conf
-                    if ocr_debug:
-                        print(f"  ACCEPTED: corrected={corrected} conf={cand_conf:.2f} (>= OCR_THRESH)")
                     break
-                if ocr_debug:
-                    print(f"  candidate raw={repr(raw)} cleaned={cleaned} corrected={corrected} is_valid={is_valid} conf={cand_conf:.2f}")
 
-            if not found_match and regex_valid_candidates:
-                best = max(regex_valid_candidates, key=lambda x: x[1])
-                if best[1] >= OCR_BEST_EFFORT_MIN_CONF:
+            # Best effort logic
+            if not found_match and candidates:
+                # Filter candidates that at least loosely match regex
+                # (Simple heuristic check)
+                best_cand = max(candidates, key=lambda x: x[1])
+                if best_cand[1] >= OCR_BEST_EFFORT_MIN_CONF:
                     found_match = True
-                    final_text = best[0]
-                    final_conf = best[1]
-                    if ocr_debug:
-                        print(f"  BEST_EFFORT: corrected={final_text} conf={final_conf:.2f}")
-
-            if not found_match and ocr_debug:
-                if not results:
-                    print(f"  NO_MATCH reason: OCR returned empty")
-                elif not regex_valid_candidates:
-                    print(f"  NO_MATCH reason: no candidate matched regex")
-                else:
-                    print(f"  NO_MATCH reason: best regex-valid conf {max(c[1] for c in regex_valid_candidates):.2f} < {OCR_BEST_EFFORT_MIN_CONF}")
+                    final_text = best_cand[0]
+                    final_conf = best_cand[1]
 
             if found_match and final_text:
                 color = (0, 255, 0) if is_authorized(final_text) else (255, 255, 255)
                 shared_state.set_display_text(camera_id, box_id, final_text, color)
-                shared_state.add_plate_vote(box_id, final_text)
                 similar, _ = shared_state.is_similar_to_recent(final_text, time.time())
+                
                 if not similar:
-                    if 'containernum' in class_type:
-                        data_type = 'containernum'
-                    elif 'containerplate' in class_type:
-                        data_type = 'containerplate'
-                    elif 'licenseplate' in class_type:
-                        data_type = 'licenseplate'
-                    elif 'usdot' in class_type:
-                        data_type = 'usdot'
-                    elif 'trailernum' in class_type:
-                        data_type = 'trailernum'
-                    else:
-                        data_type = 'container' if 'container' in class_type else 'plate'
-                    csv_logger.log(camera_id, final_text, data_type, final_conf)
+                    csv_logger.log(camera_id, final_text, class_type, final_conf)
                     shared_state.update_seen_plate(final_text, time.time())
+                    if ocr_debug: print(f"LOGGED: {final_text} ({class_type})")
 
             ocr_queue.task_done()
         except queue.Empty: continue
@@ -654,13 +665,10 @@ if user_res:
     resolution = (resW, resH)
 else: resolution = (640, 480)
 
-# FIX: Smart ID Generation (Uses filenames)
 camera_ids = []
 for i, src in enumerate(sources):
-    if os.path.isfile(src):
-        camera_ids.append(os.path.basename(src))
-    else:
-        camera_ids.append(f"cam{i}")
+    if os.path.isfile(src): camera_ids.append(os.path.basename(src))
+    else: camera_ids.append(f"cam{i}")
 
 shared_state.set_static_cameras(camera_ids, sources)
 
@@ -689,8 +697,7 @@ try:
                 continue
             
             frame = f.copy()
-            if FEED_ENHANCE:
-                frame = enhance_frame(frame)
+            if FEED_ENHANCE: frame = enhance_frame(frame)
             fps_map[cid] = cam.fps
             
             if not yolo_input_queue.full():

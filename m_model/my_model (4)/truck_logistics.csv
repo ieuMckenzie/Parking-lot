@@ -33,3 +33,8 @@ Timestamp,Camera_ID,Value,Data_Type,Confidence
 2026-02-18 18:03:03,s3.png,108910806,licenseplate,0.65
 2026-02-18 18:03:03,s3.png,108910806,licenseplate,0.65
 2026-02-18 18:04:12,s3.png,108910806,licenseplate,0.65
+2026-02-18 18:31:39,s3.png,8970806,licenseplate,0.93
+2026-02-18 18:35:56,s8.png,2UHJUM19080168,licenseplate,0.57
+2026-02-18 18:36:32,s3.png,8970806,licenseplate,0.93
+2026-02-18 19:05:10,s1.png,1354U,trailernum,1.00
+2026-02-18 19:05:11,s1.png,LMAZS4,licenseplate,0.50
