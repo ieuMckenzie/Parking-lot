@@ -507,11 +507,17 @@ def yolo_worker():
                         h, w = frame.shape[:2]
                         x1, y1, x2, y2 = det['rect']
                         
-                        # Dynamic padding
-                        pad_x_pct = 0.20
-                        pad_y_pct = 0.15
+                        # Dynamic padding - scale inversely with crop size
+                        crop_h = y2 - y1
+                        if crop_h < 30:
+                            pad_x_pct, pad_y_pct = 0.40, 0.35
+                        elif crop_h < 60:
+                            pad_x_pct, pad_y_pct = 0.30, 0.25
+                        else:
+                            pad_x_pct, pad_y_pct = 0.20, 0.15
                         if det['label'] in ('licenseplate', 'containerplate'):
-                            pad_x_pct, pad_y_pct = 0.28, 0.22
+                            pad_x_pct += 0.08
+                            pad_y_pct += 0.07
                         
                         px, py = int((x2-x1) * pad_x_pct), int((y2-y1) * pad_y_pct)
                         crop = frame[max(0, y1-py):min(h, y2+py), max(0, x1-px):min(w, x2+px)]
@@ -663,7 +669,7 @@ threading.Thread(target=yolo_worker, daemon=True).start()
 if user_res:
     resW, resH = map(int, user_res.split('x'))
     resolution = (resW, resH)
-else: resolution = (640, 480)
+else: resolution = (1920, 1080)
 
 camera_ids = []
 for i, src in enumerate(sources):
