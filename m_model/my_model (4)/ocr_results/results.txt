@@ -1,0 +1,89 @@
+OCR Test Results - 2026-02-25 17:21:13
+SR models: fsrcnn_x3, edsr_x3
+Scale(s): 3
+Preprocessing: ON
+
+############################################################
+# Image: s2.png
+############################################################
+  Size: 2008x1302
+
+  ========================================================
+  Detection 1: LicensePlate (conf=0.89) at [1324,779,1371,818]
+  ========================================================
+  Crop size: 75x57
+
+  [RAW CROP]
+    'F832303' (conf=0.73)
+    (best via: sharpen)
+
+  [FSRCNN_X3] -> 225x171
+    'F832003' (conf=0.80)
+    (best via: clahe+sharpen)
+
+  [EDSR_X3] -> 225x171
+    'P838003' (conf=0.88)
+    (best via: sharpen)
+
+  Saved: ocr_results/s2_det1_LicensePlate.png
+
+  ========================================================
+  Detection 2: ContainerNum (conf=0.87) at [1475,496,1558,569]
+  ========================================================
+  Crop size: 115x93
+
+  [RAW CROP]
+    'JBHU' (conf=0.95)
+    '340452' (conf=1.00)
+
+  [FSRCNN_X3] -> 345x279
+    '340452' (conf=1.00)
+    'UBHU' (conf=0.98)
+    (best via: sharpen)
+
+  [EDSR_X3] -> 345x279
+    '340452' (conf=1.00)
+    'UBHU' (conf=0.95)
+    (best via: sharpen)
+
+  Saved: ocr_results/s2_det2_ContainerNum.png
+
+  ========================================================
+  Detection 3: USDOT (conf=0.85) at [711,836,830,877]
+  ========================================================
+  Crop size: 189x61
+
+  [RAW CROP]
+    'TransportatianLlL' (conf=0.89)
+    'US DOT 2247083' (conf=0.98)
+
+  [FSRCNN_X3] -> 567x183
+    'TransportationLL' (conf=0.95)
+    'US DOT 2247083' (conf=1.00)
+
+  [EDSR_X3] -> 567x183
+    'TransportatonLl' (conf=0.84)
+    '2247083' (conf=1.00)
+    'US DOT 2' (conf=0.87)
+
+  Saved: ocr_results/s2_det3_USDOT.png
+
+  ========================================================
+  Detection 4: ContainerPlate (conf=0.63) at [1252,727,1325,762]
+  ========================================================
+  Crop size: 115x51
+
+  [RAW CROP]
+    'JBHZ912735' (conf=0.93)
+    (best via: sharpen)
+
+  [FSRCNN_X3] -> 345x153
+    'UBHZ912735' (conf=0.87)
+    (best via: sharpen)
+
+  [EDSR_X3] -> 345x153
+    '1BHZ912735' (conf=0.86)
+    (best via: clahe+sharpen)
+
+  Saved: ocr_results/s2_det4_ContainerPlate.png
+
