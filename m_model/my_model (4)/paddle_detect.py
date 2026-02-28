@@ -34,11 +34,12 @@ OCR_MIN_HEIGHT = 48         # Paddle expects ~32-48px height. 220 was too slow.
 OCR_USE_BINARIZATION = False
 OCR_MAG_RATIO = 1.5         # 1.5x is usually sufficient for 1080p
 OCR_BEST_EFFORT_MIN_CONF = 0.30
-OCR_UPSCALE = 2.0           # 2.0x is safer than 3.0x (artifacts)
-OCR_SMALL_CROP_HEIGHT = 40
-OCR_UPSCALE_SMALL = 3.0     # Only upscale tiny crops significantly
 # INTER_LINEAR is much faster than LANCZOS4 and sufficient for OCR
-OCR_INTERP = cv2.INTER_LINEAR 
+OCR_INTERP = cv2.INTER_LINEAR
+
+# Super-resolution: target crop width after upscaling
+SR_TARGET_WIDTH = 280       # Crops below this get SR upscaled
+SR_MODEL_DIR = os.path.join(os.path.dirname(__file__), "sr_models")
 
 FEED_ENHANCE = True         # Keep True for human visualization
 
@@ -70,6 +71,7 @@ parser.add_argument('--ocr-workers', help='Number of OCR threads', type=int, def
 parser.add_argument('--ocr-debug', help='Print OCR diagnostics', action='store_true')
 parser.add_argument('--use-gpu', help='Enable GPU for PaddleOCR', action='store_true')
 parser.add_argument('--no-enhance-feed', help='Disable frame enhancement', action='store_true')
+parser.add_argument('--no-sr', help='Disable super-resolution upscaling (use cv2.resize instead)', action='store_true')
 args = parser.parse_args()
 
 model_path = args.model
@@ -97,6 +99,42 @@ labels = model.names
 print(f"Initializing PaddleOCR (GPU={use_gpu})...")
 # PaddleOCR 3.x: only lang is supported; use_gpu/show_log/det_* are not in this API
 reader = PaddleOCR(lang='en')
+
+# --- SUPER-RESOLUTION ---
+sr_models = {}  # {scale: sr_object}
+if not args.no_sr:
+    for scale in (2, 3, 4):
+        pb_path = os.path.join(SR_MODEL_DIR, f"FSRCNN_x{scale}.pb")
+        if os.path.exists(pb_path):
+            sr = cv2.dnn_superres.DnnSuperResImpl_create()
+            sr.readModel(pb_path)
+            sr.setModel("fsrcnn", scale)
+            sr_models[scale] = sr
+            print(f"  Loaded SR model: FSRCNN x{scale}")
+    if not sr_models:
+        print("  WARNING: No SR models found in sr_models/, falling back to cv2.resize")
+
+def adaptive_upscale(img):
+    """Upscale crop to target width using the best SR scale, or skip if already large enough."""
+    h, w = img.shape[:2]
+    if w >= SR_TARGET_WIDTH or not sr_models:
+        return img
+    ideal_scale = SR_TARGET_WIDTH / w
+    # Pick the closest available scale that doesn't overshoot too much
+    best_scale = None
+    for s in sorted(sr_models.keys()):
+        if s >= ideal_scale:
+            best_scale = s
+            break
+    # If all scales are too small, use the largest available
+    if best_scale is None:
+        best_scale = max(sr_models.keys())
+    return sr_models[best_scale].upsample(img)
+
+def sharpen(img):
+    """Unsharp mask sharpening for better OCR edge contrast."""
+    blurred = cv2.GaussianBlur(img, (0, 0), 3)
+    return cv2.addWeighted(img, 1.5, blurred, -0.5, 0)
 
 log_filename = 'truck_logistics.csv'
 authorized_plates = set()
@@ -569,11 +607,9 @@ def ocr_worker(wid):
             data = ocr_queue.get(timeout=1)
             img_crop, conf_yolo, box_id, camera_id, class_type = data
 
-            # Adaptive upscale
-            h_crop = img_crop.shape[0] if hasattr(img_crop, 'shape') else 0
-            upscale = OCR_UPSCALE_SMALL if (h_crop > 0 and h_crop < OCR_SMALL_CROP_HEIGHT) else OCR_UPSCALE
-            if upscale != 1.0:
-                img_crop = cv2.resize(img_crop, None, fx=upscale, fy=upscale, interpolation=OCR_INTERP)
+            # Adaptive super-resolution upscale + sharpen
+            img_crop = adaptive_upscale(img_crop)
+            img_crop = sharpen(img_crop)
 
             def get_avg_conf(res):
                 if not res: return 0.0
