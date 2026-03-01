@@ -56,6 +56,7 @@ class TextValidator:
 
         if len(options) > self.cfg.max_confusable_indices:
             options = options[: self.cfg.max_confusable_indices]
+            indices = indices[: self.cfg.max_confusable_indices]
 
         for combo in itertools.product(*options):
             for i, idx in enumerate(indices):
