@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Model weights (large binary files)
+*.pt
+*.pb
+*.onnx
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime data
+*.csv
+truck_logistics.csv
+
+# Test artifacts
+ocr_results/
+
+# UV
+.python-version
