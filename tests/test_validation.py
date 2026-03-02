@@ -106,8 +106,6 @@ class TestSmartCorrection:
         assert result == "ABC1234"
 
     def test_no_confusables_returns_original(self, validator):
-        # "ABCDEFG" has no confusable chars (A,C,E,F not in map)
-        # Actually wait — B is confusable. Let me pick chars that aren't.
         # Confusable keys: B,8,Q,0,D,O,S,5,Z,2,G,6,I,1
         result = validator.smart_correction("ACEX")
         assert result == "ACEX"

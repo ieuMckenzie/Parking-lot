@@ -18,6 +18,7 @@ from parking_lot.config import (
     ValidationConfig,
 )
 from parking_lot.core.validation import TextValidator
+from parking_lot.engine.events import EventBus
 from parking_lot.engine.logger import CSVLogger
 from parking_lot.engine.state import SharedState
 
@@ -105,6 +106,9 @@ def mock_engine(tmp_path):
     engine.cfg.validation.authorized_file = str(auth_file)
     engine.validator = TextValidator(ValidationConfig(authorized_file=str(auth_file)))
     engine.validator.refresh_authorized()
+
+    # Event bus
+    engine.events = EventBus()
 
     engine.stop = MagicMock()
     return engine

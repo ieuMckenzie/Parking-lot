@@ -18,4 +18,5 @@ def health(engine: ScannerEngine = Depends(get_engine)):
         yolo_queue_size=q["yolo_queue"],
         ocr_queue_size=q["ocr_queue"],
         num_cameras=len(engine.cameras),
+        sse_subscribers=engine.events.subscriber_count,
     )

@@ -5,14 +5,23 @@ description = "Parking lot and truck logistics scanner with YOLO + PaddleOCR"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
+    "opencv-contrib-python>=4.0",
     "paddleocr>=3.4.0",
+    "paddlepaddle>=3.0",
     "ultralytics>=8.4.15",
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
 ]
 
+[tool.uv]
+override-dependencies = [
+    "opencv-python>=4.0 ; python_version == '0'",
+    "opencv-python-headless>=4.0 ; python_version == '0'",
+]
+
 [project.scripts]
 parking-scanner = "parking_lot.cli:main"
+parking-scanner-gui = "parking_lot.gui:main"
 
 [dependency-groups]
 dev = [

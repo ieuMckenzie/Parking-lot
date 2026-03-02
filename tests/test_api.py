@@ -1,5 +1,8 @@
 """Tests for the FastAPI API layer using a mock engine."""
 
+import threading
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -28,6 +31,7 @@ class TestHealth:
         assert data["num_cameras"] == 1
         assert "yolo_queue_size" in data
         assert "ocr_queue_size" in data
+        assert "sse_subscribers" in data
 
 
 class TestCameras:
@@ -146,3 +150,48 @@ class TestAuthorized:
     def test_remove_nonexistent(self, client):
         resp = client.delete("/api/v1/config/authorized/DOESNOTEXIST")
         assert resp.status_code == 404
+
+
+class TestSSE:
+    """Test SSE format and route registration.
+
+    Note: SSE streaming can't be reliably tested with FastAPI's TestClient
+    because the ASGI transport doesn't cleanly cancel long-lived generators.
+    The EventBus pub/sub logic is tested thoroughly in test_events.py.
+    Here we test the format helper and verify the route exists.
+    """
+
+    def test_format_sse_detection(self):
+        from parking_lot.api.routers.events import _format_sse
+
+        event = {"type": "detection", "camera_id": "cam0", "value": "ABC123"}
+        result = _format_sse(event)
+        lines = result.strip().split("\n")
+        assert lines[0] == "event: detection"
+        assert lines[1].startswith("data: ")
+        assert '"ABC123"' in lines[1]
+        # Must end with double newline (SSE spec)
+        assert result.endswith("\n\n")
+
+    def test_format_sse_custom_type(self):
+        from parking_lot.api.routers.events import _format_sse
+
+        event = {"type": "alert", "message": "gate opened"}
+        result = _format_sse(event)
+        assert result.startswith("event: alert\n")
+
+    def test_format_sse_default_type(self):
+        from parking_lot.api.routers.events import _format_sse
+
+        event = {"value": "no type field"}
+        result = _format_sse(event)
+        assert result.startswith("event: message\n")
+
+    def test_events_route_registered(self, client):
+        """The /events route should exist (not 404/405)."""
+        # Use a regular GET — it will start streaming, but we just check
+        # the route is reachable by verifying the OpenAPI schema includes it
+        openapi = client.get("/openapi.json").json()
+        paths = openapi["paths"]
+        assert "/api/v1/events" in paths
+        assert "get" in paths["/api/v1/events"]

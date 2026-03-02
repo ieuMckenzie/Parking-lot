@@ -9,6 +9,7 @@ class HealthResponse(BaseModel):
     yolo_queue_size: int
     ocr_queue_size: int
     num_cameras: int
+    sse_subscribers: int
 
 
 class CameraStatus(BaseModel):

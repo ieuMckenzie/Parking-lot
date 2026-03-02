@@ -17,6 +17,7 @@ from parking_lot.core.ocr import OCRReader, stitch_results
 from parking_lot.core.preprocessing import enhance_frame
 from parking_lot.core.super_resolution import SuperResolution
 from parking_lot.core.validation import TextValidator
+from parking_lot.engine.events import EventBus
 from parking_lot.engine.logger import CSVLogger
 from parking_lot.engine.state import SharedState
 
@@ -47,6 +48,7 @@ class ScannerEngine:
         self.validator = TextValidator(cfg.validation)
         self.state = SharedState(cfg.detection)
         self.logger = CSVLogger()
+        self.events = EventBus()
 
         # Queues
         self.yolo_queue: queue.Queue = queue.Queue(maxsize=4)
@@ -253,6 +255,14 @@ class ScannerEngine:
                     if not similar:
                         self.logger.log(camera_id, final_text, class_type, final_conf)
                         self.state.update_seen_plate(final_text, time.time())
+                        self.events.publish({
+                            "type": "detection",
+                            "camera_id": camera_id,
+                            "value": final_text,
+                            "data_type": class_type,
+                            "confidence": round(final_conf, 3),
+                            "authorized": self.validator.is_authorized(final_text),
+                        })
                         if self.cfg.ocr_debug:
                             print(f"LOGGED: {final_text} ({class_type})")
 
