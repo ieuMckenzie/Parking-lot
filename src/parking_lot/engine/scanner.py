@@ -261,6 +261,9 @@ class ScannerEngine:
                     self.state.set_display_text(camera_id, box_id, final_text, color)
                     similar, _ = self.state.is_similar_to_recent(final_text, time.time())
 
+                    auth_str = " [AUTHORIZED]" if self.validator.is_authorized(final_text) else ""
+                    print(f"OCR: {final_text} ({class_type} {final_conf:.2f}) [{camera_id}]{auth_str}")
+
                     if not similar:
                         self.logger.log(camera_id, final_text, class_type, final_conf)
                         self.state.update_seen_plate(final_text, time.time())

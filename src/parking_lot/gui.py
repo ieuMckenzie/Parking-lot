@@ -273,7 +273,12 @@ class ScannerGUI:
 
     def _run_engine(self, model: str, source: str):
         try:
+            import cv2
             from parking_lot.config import ScannerConfig, CameraConfig, SRConfig
+
+            # Ensure any previous cv2 windows are fully cleaned up
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
 
             cfg = ScannerConfig(
                 model_path=model,
