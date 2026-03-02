@@ -16,7 +16,7 @@ class OCRReader:
     def __init__(self, cfg: OCRConfig):
         self.cfg = cfg
         print(f"Initializing PaddleOCR (lang={cfg.lang})...")
-        self.reader = PaddleOCR(lang=cfg.lang)
+        self.reader = PaddleOCR(lang=cfg.lang, enable_mkldnn=False)
 
     def read_text(self, processed_img: np.ndarray) -> list[tuple[np.ndarray, str, float]]:
         """Run PaddleOCR on a preprocessed image.

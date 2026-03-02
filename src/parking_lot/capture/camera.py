@@ -8,6 +8,8 @@ import time
 import cv2
 import numpy as np
 
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+
 
 class CameraCapture:
     """Captures frames from a video source in a background thread."""
@@ -26,10 +28,33 @@ class CameraCapture:
         self.fps: float = 0.0
         self.last_frame_time: float = 0
         self.is_connected: bool = False
+        self.is_image: bool = self._check_is_image()
+
+    def _check_is_image(self) -> bool:
+        if isinstance(self.source_spec, str) and os.path.isfile(self.source_spec):
+            _, ext = os.path.splitext(self.source_spec)
+            return ext.lower() in _IMAGE_EXTS
+        return False
 
     def start(self):
         self.running = True
-        threading.Thread(target=self._capture_loop, daemon=True).start()
+        if self.is_image:
+            self._load_image()
+        else:
+            threading.Thread(target=self._capture_loop, daemon=True).start()
+
+    def _load_image(self):
+        """Load a single image into the frame buffer (no looping thread needed)."""
+        frame = cv2.imread(self.source_spec)
+        if frame is not None:
+            if self.resolution:
+                frame = cv2.resize(frame, self.resolution)
+            with self.buffer_lock:
+                self.frame_buffer.append((frame, time.time()))
+            self.is_connected = True
+            print(f"System: Loaded {self.camera_id}")
+        else:
+            print(f"Error: Could not read image {self.source_spec}")
 
     def stop(self):
         self.running = False

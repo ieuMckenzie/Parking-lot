@@ -6,10 +6,6 @@ dist/
 build/
 .venv/
 
-# Model weights (large binary files)
-*.pt
-*.pb
-*.onnx
 
 # IDE
 .vscode/
@@ -28,3 +24,5 @@ ocr_results/
 
 # UV
 .python-version
+.claude/
+CLAUDE.md

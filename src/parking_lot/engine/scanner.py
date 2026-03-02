@@ -118,6 +118,9 @@ class ScannerEngine:
                 (self.grid.canvas_width, self.grid.canvas_height),
             )
 
+        # Track which image-based cameras have already been sent to YOLO
+        yolo_sent: set[str] = set()
+
         try:
             while self._running:
                 frames = {}
@@ -134,8 +137,14 @@ class ScannerEngine:
                         frame = enhance_frame(frame)
                     fps_map[cid] = cam.fps
 
-                    if not self.yolo_queue.full():
-                        self.yolo_queue.put((frame, cid))
+                    # Only send to YOLO once for static images
+                    if cam.is_image:
+                        if cid not in yolo_sent and not self.yolo_queue.full():
+                            self.yolo_queue.put((frame, cid))
+                            yolo_sent.add(cid)
+                    else:
+                        if not self.yolo_queue.full():
+                            self.yolo_queue.put((frame, cid))
 
                     detections = self.state.get_detections(cid)
                     for det in detections:
