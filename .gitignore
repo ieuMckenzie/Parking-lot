@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+
+
+# CSV logs
+*.csv
+
+# macOS
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
