@@ -14,3 +14,8 @@ dependencies = [
     "ultralytics>=8.4.19",
     "uvicorn>=0.41.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
