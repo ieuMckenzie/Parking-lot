@@ -29,7 +29,10 @@ class OCRConfig(BaseSettings):
 
     det_model: str = Field(default="PP-OCRv5_mobile_det", description="PaddleOCR detection model name")
     rec_model: str = Field(default="PP-OCRv5_mobile_rec", description="PaddleOCR recognition model name")
+    fallback_rec_model: str = Field(default="PP-OCRv5_server_rec", description="Fallback model when primary returns empty")
     padding_ratio: float = Field(default=0.2, description="Bbox padding ratio before OCR")
+    small_crop_padding: float = Field(default=0.5, description="Extra padding for small detections (< 150px)")
+    small_crop_threshold: int = Field(default=150, description="Detections smaller than this (pixels) get extra padding")
 
 
 class FusionConfig(BaseSettings):

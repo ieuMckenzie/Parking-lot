@@ -65,8 +65,14 @@ def process_frame_verbose(
     reads: list[Read] = []
     h, w = frame.shape[:2]
 
+    small_threshold = settings.ocr.small_crop_threshold
+    small_padding = settings.ocr.small_crop_padding
+
     for det in detections:
-        x1, y1, x2, y2 = det.pad(padding_ratio, (h, w))
+        bbox_w = det.bbox[2] - det.bbox[0]
+        bbox_h = det.bbox[3] - det.bbox[1]
+        pad = small_padding if (bbox_w < small_threshold or bbox_h < small_threshold) else padding_ratio
+        x1, y1, x2, y2 = det.pad(pad, (h, w))
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             print(f"{prefix}  [{det.class_name}] bbox={det.bbox} conf={det.confidence:.2f} → SKIP (empty crop)")
@@ -279,7 +285,7 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument("input", help="Video file or image directory")
-    parser.add_argument("-m", "--model", default="models/yolo/my_model.pt", help="YOLO model path")
+    parser.add_argument("-m", "--model", default="models/paddle/my_model.pt", help="YOLO model path")
     parser.add_argument("-c", "--confidence", type=float, default=0.25, help="Detection confidence threshold")
     parser.add_argument("--csv", default=None, help="CSV output path for per-frame reads")
     parser.add_argument("--db", default=None, help="SQLite database path (default: in-memory)")
