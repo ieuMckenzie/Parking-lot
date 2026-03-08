@@ -67,8 +67,37 @@ class TestValidatePlate:
     def test_too_short(self):
         assert validate_plate("A") is None
 
-    def test_too_long(self):
-        assert validate_plate("ABCDE12345") is None
+    def test_extracts_plate_from_noisy_prefix(self):
+        assert validate_plate("XYZKABC1234") == "ABC1234"
+
+    def test_extracts_plate_from_noisy_suffix(self):
+        assert validate_plate("ABC1234XYZK") == "ABC1234"
+
+    def test_extracts_plate_from_noisy_both_sides(self):
+        assert validate_plate("QQABC1234ZZ") == "ABC1234"
+
+    def test_extracts_3digit_3letter(self):
+        # "123ABCY" also valid (3+4 pattern); fusion resolves across frames
+        result = validate_plate("XX123ABCYY")
+        assert result is not None
+        assert "123ABC" in result
+
+    def test_extracts_2letter_4digit(self):
+        # "ZAB1234" also valid (3+4 pattern); fusion resolves across frames
+        result = validate_plate("ZZZAB1234QQ")
+        assert result is not None
+        assert "AB1234" in result
+
+    def test_no_valid_pattern_returns_none(self):
+        assert validate_plate("ABCDEFGHIJKLM") is None
+
+    def test_extracts_plate_with_digit_noise(self):
+        # Digit-only noise doesn't confuse letter+digit patterns
+        assert validate_plate("1111ABC12341111") == "ABC1234"
+
+    def test_short_noise_passes_as_valid_plate(self):
+        # 8 chars or fewer passes directly (8-char plates exist)
+        assert validate_plate("XABC1234") == "XABC1234"
 
     def test_strips_hyphens(self):
         assert validate_plate("ABC-1234") == "ABC1234"

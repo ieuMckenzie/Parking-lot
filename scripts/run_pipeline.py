@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 from sqlmodel import SQLModel, Session
 
 from backend.config import settings
@@ -35,10 +36,59 @@ from backend.fusion.models import Read
 from backend.fusion.pipeline import process_frame
 from backend.fusion.tracker import TrackManager
 from backend.recognition.ocr import OCREngine
+from backend.recognition.postprocess import postprocess
 from backend.utils.csv_logger import append_reads
 from backend.utils.logging import setup_logging, get_logger
 
 log = get_logger("pipeline")
+
+# Global verbose flag
+_verbose = False
+
+
+def process_frame_verbose(
+    frame: np.ndarray,
+    detector: Detector,
+    ocr: OCREngine,
+    camera_id: str,
+    timestamp: float,
+    padding_ratio: float = 0.2,
+    label: str = "",
+) -> list[Read]:
+    """Like process_frame, but prints every detection, OCR read, and rejection."""
+    detections = detector.detect(frame)
+    if not detections:
+        return []
+
+    prefix = f"  {label}" if label else "  "
+    print(f"{prefix}YOLO: {len(detections)} detections")
+    reads: list[Read] = []
+    h, w = frame.shape[:2]
+
+    for det in detections:
+        x1, y1, x2, y2 = det.pad(padding_ratio, (h, w))
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            print(f"{prefix}  [{det.class_name}] bbox={det.bbox} conf={det.confidence:.2f} → SKIP (empty crop)")
+            continue
+
+        raw_text, confidence = ocr.recognize(crop)
+        cleaned = postprocess(raw_text, det.class_name)
+
+        if cleaned is None:
+            print(f"{prefix}  [{det.class_name}] conf={det.confidence:.2f} → OCR='{raw_text}' (ocr_conf={confidence:.2f}) → REJECTED by postprocess")
+        else:
+            print(f"{prefix}  [{det.class_name}] conf={det.confidence:.2f} → OCR='{raw_text}' → cleaned='{cleaned}' (ocr_conf={confidence:.2f})")
+            reads.append(Read(
+                text=cleaned,
+                raw_text=raw_text,
+                confidence=confidence,
+                class_name=det.class_name,
+                camera_id=camera_id,
+                timestamp=timestamp,
+            ))
+
+    return reads
 
 
 def process_video(
@@ -54,7 +104,7 @@ def process_video(
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
-    video_fps = cap.get(cv2.CAP_PROP_FRAME_FPS) or 30.0
+    video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"Processing {video_path.name}: {total} frames at {video_fps:.1f} fps")
 
@@ -67,10 +117,14 @@ def process_video(
             break
 
         timestamp = idx / video_fps
-        reads = process_frame(frame, detector, ocr, camera_id, timestamp)
+        if _verbose:
+            reads = process_frame_verbose(frame, detector, ocr, camera_id, timestamp, label=f"Frame {idx}:")
+        else:
+            reads = process_frame(frame, detector, ocr, camera_id, timestamp)
 
         if reads:
-            print(f"  Frame {idx}: {len(reads)} reads → {', '.join(f'{r.class_name}={r.text} ({r.confidence:.2f})' for r in reads)}")
+            if not _verbose:
+                print(f"  Frame {idx}: {len(reads)} reads → {', '.join(f'{r.class_name}={r.text} ({r.confidence:.2f})' for r in reads)}")
             if csv_path:
                 append_reads(csv_path, reads)
 
@@ -117,6 +171,51 @@ def process_video(
     print(f"Tracks completed: {len(track_manager.completed)}")
 
 
+def process_image(
+    image_path: Path,
+    detector: Detector,
+    ocr: OCREngine,
+    track_manager: TrackManager,
+    session: Session,
+    csv_path: str | None,
+    camera_id: str = "cam1",
+) -> None:
+    frame = cv2.imread(str(image_path))
+    if frame is None:
+        raise RuntimeError(f"Cannot read image: {image_path}")
+
+    print(f"Processing image: {image_path.name}")
+
+    if _verbose:
+        reads = process_frame_verbose(frame, detector, ocr, camera_id, timestamp=0.0)
+    else:
+        reads = process_frame(frame, detector, ocr, camera_id, timestamp=0.0)
+    if reads:
+        if not _verbose:
+            for r in reads:
+                print(f"  {r.class_name}: {r.text} (conf: {r.confidence:.2f})")
+        if csv_path:
+            append_reads(csv_path, reads)
+    else:
+        print("  No reads detected.")
+
+    track_manager.update(reads, now=0.0)
+    result = track_manager.flush()
+    if result is not None:
+        track = track_manager.completed[-1][0]
+        event = handle_track_closed(track_id=track.id, results=result, session=session)
+        print(f"\n  === GATE EVENT ===")
+        print(f"  Decision: {event.decision.value}")
+        print(f"  Reason:   {event.decision_reason}")
+        if event.usdot_number:
+            print(f"  USDOT:    {event.usdot_number} (conf: {event.usdot_confidence:.2f})")
+        if event.license_plate:
+            print(f"  Plate:    {event.license_plate} (conf: {event.license_plate_confidence:.2f})")
+        if event.trailer_number:
+            print(f"  Trailer:  {event.trailer_number} (conf: {event.trailer_confidence:.2f})")
+        print()
+
+
 def process_images(
     image_dir: Path,
     detector: Detector,
@@ -142,10 +241,14 @@ def process_images(
             continue
 
         timestamp = float(idx)
-        reads = process_frame(frame, detector, ocr, camera_id, timestamp)
+        if _verbose:
+            reads = process_frame_verbose(frame, detector, ocr, camera_id, timestamp, label=f"{img_path.name}:")
+        else:
+            reads = process_frame(frame, detector, ocr, camera_id, timestamp)
 
         if reads:
-            print(f"  {img_path.name}: {len(reads)} reads → {', '.join(f'{r.class_name}={r.text} ({r.confidence:.2f})' for r in reads)}")
+            if not _verbose:
+                print(f"  {img_path.name}: {len(reads)} reads → {', '.join(f'{r.class_name}={r.text} ({r.confidence:.2f})' for r in reads)}")
             if csv_path:
                 append_reads(csv_path, reads)
 
@@ -186,9 +289,16 @@ def main():
         "--allow", action="append", default=[], metavar="TYPE:VALUE",
         help="Seed allowlist entry, e.g. --allow USDOT:1234567 --allow LicensePlate:ABC1234",
     )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Show all detections, raw OCR output, and rejected reads",
+    )
 
     args = parser.parse_args()
     setup_logging(debug=True)
+
+    global _verbose
+    _verbose = args.verbose
 
     # Database setup
     db_url = f"sqlite:///{args.db}" if args.db else "sqlite://"  # in-memory by default
@@ -212,9 +322,12 @@ def main():
 
     track_manager = TrackManager(timeout=args.timeout)
 
+    image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
     inp = Path(args.input)
     if inp.is_dir():
         process_images(inp, detector, ocr, track_manager, session, args.csv, args.camera_id)
+    elif inp.is_file() and inp.suffix.lower() in image_extensions:
+        process_image(inp, detector, ocr, track_manager, session, args.csv, args.camera_id)
     elif inp.is_file():
         process_video(inp, detector, ocr, track_manager, session, args.csv, args.camera_id)
     else:

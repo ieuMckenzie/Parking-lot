@@ -45,12 +45,43 @@ def validate_usdot(text: str) -> str | None:
 
 
 def validate_plate(text: str) -> str | None:
-    """Validate US license plate: 2-8 alphanumeric characters."""
+    """Validate US license plate: 2-8 alphanumeric characters.
+
+    If the full text is too long, tries to extract a substring matching
+    common US plate patterns (e.g., ABC1234, 123ABC, AB1234).
+    """
     text = normalize(text)
-    # US plates are typically 2-8 alphanumeric chars, may include hyphens
     text = re.sub(r"[^A-Z0-9]", "", text)
     if 2 <= len(text) <= 8:
         return text
+    if len(text) > 8:
+        return _extract_plate(text)
+    return None
+
+
+# Common US plate formats for fullmatch extraction
+_PLATE_FORMATS = [
+    re.compile(r"[A-Z]{3}\d{4}"),       # ABC1234
+    re.compile(r"[A-Z]{2}\d{4}"),        # AB1234
+    re.compile(r"\d{3}[A-Z]{3}"),        # 123ABC
+    re.compile(r"\d{3}[A-Z]{4}"),        # 123ABCD
+    re.compile(r"[A-Z]{3}\d{3}"),        # ABC123
+    re.compile(r"[A-Z]\d{3}[A-Z]{3}"),   # A123BCD
+    re.compile(r"\d[A-Z]{3}\d{3}"),       # 1ABC234
+    re.compile(r"[A-Z]{2}\d{3}[A-Z]"),   # AB123C
+    re.compile(r"[A-Z]{2}\d{2}[A-Z]{2}"),  # AB12CD
+    re.compile(r"[A-Z]\d{2}[A-Z]{3}"),   # A12BCD
+    re.compile(r"[A-Z]{2}\d{5}"),        # AB12345
+    re.compile(r"\d{2}[A-Z]{3}"),        # 12ABC
+]
+
+
+def _extract_plate(text: str) -> str | None:
+    """Try each plate pattern in priority order, return first match."""
+    for fmt in _PLATE_FORMATS:
+        m = fmt.search(text)
+        if m:
+            return m.group()
     return None
 
 

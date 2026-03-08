@@ -19,11 +19,12 @@ venv/
 *.csv
 
 # macOS
+.DS_Store
 
 # IDE
 .vscode/
 .idea/
-.DS_Store
+
 
 
 raw/
