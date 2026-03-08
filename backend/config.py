@@ -55,6 +55,10 @@ class Settings(BaseSettings):
         default=f"sqlite:///{PROJECT_ROOT / 'gatevision.db'}",
         description="Database connection URL",
     )
+    csv_log_path: str = Field(
+        default="",
+        description="Path to CSV file for logging detections (empty = disabled)",
+    )
 
     camera: CameraConfig = CameraConfig()
     detection: DetectionConfig = DetectionConfig()
