@@ -381,6 +381,8 @@ class CameraCapture:
         self.source_spec = source_spec
         self.resolution = resolution
         self.target_fps = target_fps
+        # Default frame interval; for file sources we'll override this
+        # based on the actual video FPS so playback is close to real time.
         self.frame_interval = 1.0 / target_fps
         
         self.frame_buffer = collections.deque(maxlen=1)
@@ -401,6 +403,9 @@ class CameraCapture:
 
     def _capture_loop(self):
         last_saved_time = 0
+        # Detect whether this source is a file so we can pace frames.
+        is_file_source = isinstance(self.source_spec, str) and os.path.isfile(self.source_spec)
+        next_frame_time = 0.0
         while self.running:
             if not self.cap or not self.cap.isOpened():
                 self.is_connected = False
@@ -409,10 +414,17 @@ class CameraCapture:
                     time.sleep(1)
                 continue
 
+            # For file sources, sleep so we roughly match the frame interval.
+            if is_file_source and next_frame_time > 0.0:
+                now_sleep = time.time()
+                remaining = next_frame_time - now_sleep
+                if remaining > 0:
+                    time.sleep(remaining)
+
             ret, frame = self.cap.read()
             if not ret:
                 time.sleep(0.01) # Avoid busy loop on static files
-                if isinstance(self.source_spec, str) and os.path.isfile(self.source_spec):
+                if is_file_source:
                      self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # Loop file
                 continue
             
@@ -428,6 +440,12 @@ class CameraCapture:
                 with self.buffer_lock:
                     self.frame_buffer.append((frame, now))
                 
+                # Schedule the next frame time for file sources based
+                # on the computed frame_interval so playback speed is
+                # tied to the source FPS instead of CPU speed.
+                if is_file_source:
+                    next_frame_time = now + self.frame_interval
+
                 last_saved_time = now
 
     def _connect(self):
@@ -438,7 +456,14 @@ class CameraCapture:
             else: self.cap = cv2.VideoCapture(src)
             
             if self.cap.isOpened():
-                self.cap.set(cv2.CAP_PROP_FPS, self.target_fps) 
+                # For live cameras, hint a target FPS; for file
+                # sources, try to respect the recorded FPS.
+                if os.path.isfile(src):
+                    fps = self.cap.get(cv2.CAP_PROP_FPS)
+                    if fps and fps > 1e-3:
+                        self.frame_interval = 1.0 / fps
+                else:
+                    self.cap.set(cv2.CAP_PROP_FPS, self.target_fps)
                 if self.resolution:
                     self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.resolution[0])
                     self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.resolution[1])
