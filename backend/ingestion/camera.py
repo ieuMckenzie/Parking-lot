@@ -1,3 +1,4 @@
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -71,4 +72,66 @@ class ImageFolderCamera(CameraSource):
         self._index += 1
         if frame is None:
             return self.read()  # skip unreadable, advance index
+        return frame, timestamp
+
+
+class VideoCamera(CameraSource):
+    """Plays a video file as a camera source."""
+
+    def __init__(
+        self,
+        path: Path,
+        camera_id: str = "video",
+        realtime: bool = False,
+    ):
+        self._path = path
+        self._camera_id = camera_id
+        self._realtime = realtime
+        self._cap: cv2.VideoCapture | None = None
+        self._fps: float = 30.0
+        self._frame_idx: int = 0
+        self._start_time: float = 0.0
+        self._exhausted = False
+
+    @property
+    def camera_id(self) -> str:
+        return self._camera_id
+
+    @property
+    def active(self) -> bool:
+        return self._cap is not None and not self._exhausted
+
+    def start(self) -> None:
+        self._cap = cv2.VideoCapture(str(self._path))
+        if not self._cap.isOpened():
+            self._cap = None
+            raise RuntimeError(f"Cannot open video: {self._path}")
+        self._fps = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self._frame_idx = 0
+        self._start_time = time.monotonic()
+        self._exhausted = False
+
+    def stop(self) -> None:
+        if self._cap:
+            self._cap.release()
+            self._cap = None
+        self._exhausted = True
+
+    def read(self) -> tuple[np.ndarray, float] | None:
+        if self._cap is None or self._exhausted:
+            return None
+
+        if self._realtime:
+            target_time = self._frame_idx / self._fps
+            elapsed = time.monotonic() - self._start_time
+            if elapsed < target_time:
+                time.sleep(target_time - elapsed)
+
+        ret, frame = self._cap.read()
+        if not ret:
+            self._exhausted = True
+            return None
+
+        timestamp = self._frame_idx / self._fps
+        self._frame_idx += 1
         return frame, timestamp

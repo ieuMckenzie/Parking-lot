@@ -82,3 +82,76 @@ class TestImageFolderCamera:
         cam.start()
         cam.stop()
         assert not cam.active
+
+
+def _create_test_video(path, num_frames=10, fps=30.0):
+    """Helper: write a small test video."""
+    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+    writer = cv2.VideoWriter(str(path), fourcc, fps, (100, 100))
+    for i in range(num_frames):
+        frame = np.full((100, 100, 3), i * 25, dtype=np.uint8)
+        writer.write(frame)
+    writer.release()
+
+
+class TestVideoCamera:
+    def test_reads_all_frames(self, tmp_path):
+        from backend.ingestion.camera import VideoCamera
+
+        vid = tmp_path / "test.avi"
+        _create_test_video(vid, num_frames=5, fps=10.0)
+
+        cam = VideoCamera(path=vid, camera_id="vid1")
+        cam.start()
+
+        frames = []
+        while True:
+            result = cam.read()
+            if result is None:
+                break
+            frames.append(result)
+
+        assert len(frames) == 5
+        # Timestamps based on frame index / fps
+        assert frames[0][1] == pytest.approx(0.0)
+        assert frames[1][1] == pytest.approx(0.1)
+
+    def test_active_property(self, tmp_path):
+        from backend.ingestion.camera import VideoCamera
+
+        vid = tmp_path / "test.avi"
+        _create_test_video(vid, num_frames=2)
+
+        cam = VideoCamera(path=vid, camera_id="vid1")
+        assert not cam.active
+        cam.start()
+        assert cam.active
+        cam.read()
+        cam.read()
+        cam.read()  # returns None, exhausted
+        assert not cam.active
+
+    def test_stop_releases_capture(self, tmp_path):
+        from backend.ingestion.camera import VideoCamera
+
+        vid = tmp_path / "test.avi"
+        _create_test_video(vid, num_frames=5)
+
+        cam = VideoCamera(path=vid, camera_id="vid1")
+        cam.start()
+        cam.stop()
+        assert not cam.active
+        assert cam.read() is None
+
+    def test_invalid_path_raises(self, tmp_path):
+        from backend.ingestion.camera import VideoCamera
+
+        cam = VideoCamera(path=tmp_path / "nonexistent.avi", camera_id="vid1")
+        with pytest.raises(RuntimeError, match="Cannot open video"):
+            cam.start()
+
+    def test_camera_id(self, tmp_path):
+        from backend.ingestion.camera import VideoCamera
+
+        cam = VideoCamera(path=tmp_path / "x.avi", camera_id="myvid")
+        assert cam.camera_id == "myvid"
