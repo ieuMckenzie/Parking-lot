@@ -5,6 +5,12 @@ Automated truck gate identification system using computer vision. Reads license 
 ## Setup
 
 ```bash
+# Install uv package manager (If you don't have it already)
+# On macOS and Linux.
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# On Windows.
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
 # Install dependencies
 uv sync
 
