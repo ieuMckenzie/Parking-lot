@@ -14,6 +14,9 @@ class CameraConfig(BaseSettings):
         description="RTSP URLs for gate cameras",
     )
     capture_fps: int = Field(default=5, description="Target capture FPS per camera")
+    reconnect_max_delay: float = Field(default=30.0, description="Max RTSP reconnect delay in seconds")
+    motion_threshold: float = Field(default=0.01, description="Motion detection threshold (fraction of frame area)")
+    motion_warmup: int = Field(default=30, description="Frames to skip before motion detection activates")
 
 
 class DetectionConfig(BaseSettings):
