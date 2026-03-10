@@ -1,9 +1,14 @@
+import threading
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+from backend.utils.logging import get_logger
+
+log = get_logger("camera")
 
 
 class CameraSource(ABC):
@@ -135,3 +140,122 @@ class VideoCamera(CameraSource):
         timestamp = self._frame_idx / self._fps
         self._frame_idx += 1
         return frame, timestamp
+
+
+class ThreadedCamera(CameraSource):
+    """Base for cameras that capture in a background thread with single-slot buffer."""
+
+    def __init__(self, camera_id: str):
+        self._camera_id = camera_id
+        self._lock = threading.Lock()
+        self._latest: tuple[np.ndarray, float] | None = None
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    @property
+    def camera_id(self) -> str:
+        return self._camera_id
+
+    @property
+    def active(self) -> bool:
+        return self._running
+
+    def start(self) -> None:
+        self._running = True
+        self._thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def read(self) -> tuple[np.ndarray, float] | None:
+        with self._lock:
+            result = self._latest
+            self._latest = None
+        return result
+
+    def _store_frame(self, frame: np.ndarray, timestamp: float) -> None:
+        with self._lock:
+            self._latest = (frame, timestamp)
+
+    @abstractmethod
+    def _capture_loop(self) -> None: ...
+
+
+class RTSPCamera(ThreadedCamera):
+    """RTSP camera with auto-reconnect and exponential backoff."""
+
+    def __init__(
+        self,
+        url: str,
+        camera_id: str = "rtsp",
+        reconnect_max_delay: float = 30.0,
+    ):
+        super().__init__(camera_id)
+        self._url = url
+        self._reconnect_max_delay = reconnect_max_delay
+
+    def _capture_loop(self) -> None:
+        delay = 1.0
+        while self._running:
+            cap = cv2.VideoCapture(self._url)
+            if not cap.isOpened():
+                log.warning("rtsp_connect_failed", url=self._url, retry_in=delay)
+                time.sleep(delay)
+                delay = min(delay * 2, self._reconnect_max_delay)
+                continue
+
+            log.info("rtsp_connected", url=self._url, camera_id=self._camera_id)
+            delay = 1.0  # reset on success
+
+            while self._running:
+                ret, frame = cap.read()
+                if not ret:
+                    log.warning("rtsp_read_failed", camera_id=self._camera_id)
+                    break
+                self._store_frame(frame, time.time())
+
+            cap.release()
+
+
+class WebcamCamera(ThreadedCamera):
+    """USB webcam by device index."""
+
+    def __init__(self, device_index: int = 0, camera_id: str = "webcam"):
+        super().__init__(camera_id)
+        self._device_index = device_index
+
+    def _capture_loop(self) -> None:
+        cap = cv2.VideoCapture(self._device_index)
+        if not cap.isOpened():
+            log.error("webcam_open_failed", device=self._device_index)
+            self._running = False
+            return
+
+        log.info("webcam_opened", device=self._device_index, camera_id=self._camera_id)
+        while self._running:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            self._store_frame(frame, time.time())
+
+        cap.release()
+        self._running = False
+
+
+def parse_source(spec: str, index: int, realtime: bool = False) -> CameraSource:
+    """Parse a source specifier string into a CameraSource."""
+    camera_id = f"cam{index}"
+    if spec.startswith("rtsp://"):
+        return RTSPCamera(url=spec, camera_id=camera_id)
+    elif spec.startswith("webcam:"):
+        device = int(spec.split(":", 1)[1])
+        return WebcamCamera(device_index=device, camera_id=camera_id)
+    elif spec.startswith("images:"):
+        folder = Path(spec.split(":", 1)[1])
+        return ImageFolderCamera(folder=folder, camera_id=camera_id)
+    else:
+        return VideoCamera(path=Path(spec), camera_id=camera_id, realtime=realtime)

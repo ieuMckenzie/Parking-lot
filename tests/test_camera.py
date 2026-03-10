@@ -155,3 +155,115 @@ class TestVideoCamera:
 
         cam = VideoCamera(path=tmp_path / "x.avi", camera_id="myvid")
         assert cam.camera_id == "myvid"
+
+
+import threading
+import time
+
+
+class TestThreadedCamera:
+    def test_single_slot_buffer_keeps_latest(self):
+        from backend.ingestion.camera import ThreadedCamera
+
+        class FakeThreadedCamera(ThreadedCamera):
+            def __init__(self):
+                super().__init__(camera_id="fake")
+                self.frames_to_produce = []
+
+            def _capture_loop(self):
+                for frame, ts in self.frames_to_produce:
+                    if not self._running:
+                        break
+                    self._store_frame(frame, ts)
+                    time.sleep(0.01)
+
+        cam = FakeThreadedCamera()
+        frame_a = np.zeros((10, 10, 3), dtype=np.uint8)
+        frame_b = np.ones((10, 10, 3), dtype=np.uint8) * 128
+        cam.frames_to_produce = [(frame_a, 1.0), (frame_b, 2.0)]
+        cam.start()
+        time.sleep(0.1)  # let both frames be produced
+
+        # Should get the latest frame (frame_b)
+        result = cam.read()
+        assert result is not None
+        _, ts = result
+        assert ts == 2.0
+
+        cam.stop()
+
+    def test_read_returns_none_when_no_frame(self):
+        from backend.ingestion.camera import ThreadedCamera
+
+        class IdleCamera(ThreadedCamera):
+            def _capture_loop(self):
+                while self._running:
+                    time.sleep(0.01)
+
+        cam = IdleCamera(camera_id="idle")
+        cam.start()
+        assert cam.read() is None
+        cam.stop()
+
+    def test_read_consumes_frame(self):
+        from backend.ingestion.camera import ThreadedCamera
+
+        class OneFrameCamera(ThreadedCamera):
+            def _capture_loop(self):
+                self._store_frame(np.zeros((10, 10, 3), dtype=np.uint8), 1.0)
+                while self._running:
+                    time.sleep(0.01)
+
+        cam = OneFrameCamera(camera_id="one")
+        cam.start()
+        time.sleep(0.05)
+        assert cam.read() is not None
+        assert cam.read() is None  # consumed
+        cam.stop()
+
+    def test_stop_joins_thread(self):
+        from backend.ingestion.camera import ThreadedCamera
+
+        class SlowCamera(ThreadedCamera):
+            def _capture_loop(self):
+                while self._running:
+                    time.sleep(0.01)
+
+        cam = SlowCamera(camera_id="slow")
+        cam.start()
+        assert cam._thread is not None
+        assert cam._thread.is_alive()
+        cam.stop()
+        assert cam._thread is None or not cam._thread.is_alive()
+
+
+class TestParseSource:
+    def test_rtsp_url(self):
+        from backend.ingestion.camera import parse_source
+
+        cam = parse_source("rtsp://host/stream", index=0)
+        assert cam.camera_id == "cam0"
+        assert type(cam).__name__ == "RTSPCamera"
+
+    def test_webcam(self):
+        from backend.ingestion.camera import parse_source
+
+        cam = parse_source("webcam:0", index=1)
+        assert cam.camera_id == "cam1"
+        assert type(cam).__name__ == "WebcamCamera"
+
+    def test_image_folder(self, tmp_path):
+        from backend.ingestion.camera import parse_source
+
+        cam = parse_source(f"images:{tmp_path}", index=2)
+        assert cam.camera_id == "cam2"
+        assert type(cam).__name__ == "ImageFolderCamera"
+
+    def test_video_file(self, tmp_path):
+        from backend.ingestion.camera import parse_source
+
+        vid = tmp_path / "test.avi"
+        _create_test_video(vid, num_frames=2)
+        cam = parse_source(str(vid), index=3, realtime=True)
+        assert cam.camera_id == "cam3"
+        assert type(cam).__name__ == "VideoCamera"
