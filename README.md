@@ -24,6 +24,15 @@ The `scripts/run_live.py` script runs the full pipeline continuously on one or m
 # Single video file
 uv run python -m scripts.run_live data/DOT.mp4 --no-motion --csv detections.csv
 
+# With live display window (press Q to quit)
+uv run python -m scripts.run_live data/DOT.mp4 --no-motion --display
+
+# Record annotated output video
+uv run python -m scripts.run_live data/DOT.mp4 --no-motion --output demo.mp4
+
+# Display + record at the same time
+uv run python -m scripts.run_live data/DOT.mp4 --no-motion --display --output demo.mp4
+
 # Multiple video files as simulated cameras
 uv run python -m scripts.run_live video1.mp4 video2.mp4 --no-motion
 
@@ -37,6 +46,8 @@ uv run python -m scripts.run_live webcam:0
 uv run python -m scripts.run_live images:data/frames/
 ```
 
+The `--display` flag opens a live OpenCV window with color-coded bounding boxes, OCR text labels, an FPS counter, and decision banners (APPROVED/DENIED/FLAGGED). The `--output` flag writes the same annotated frames to a video file.
+
 ### All Options
 
 | Flag | Default | Description |
@@ -48,6 +59,8 @@ uv run python -m scripts.run_live images:data/frames/
 | `--timeout` | `5.0` | Fusion track timeout in seconds |
 | `--realtime` | _(off)_ | Play video files at real-time speed |
 | `--no-motion` | _(off)_ | Disable motion detection filter |
+| `--display` | _(off)_ | Show live OpenCV window with annotations |
+| `--output PATH` | _(disabled)_ | Write annotated video to file |
 | `--allow TYPE:VALUE` | _(none)_ | Seed an allowlist entry (repeatable) |
 
 ## Running the Pipeline
@@ -131,7 +144,7 @@ backend/
 ├── detection/             # YOLO detector wrapper
 ├── fusion/                # Temporal fusion (tracker, voter, pipeline)
 ├── recognition/           # PaddleOCR 3.x full pipeline (det+rec) + regex postprocessing
-└── utils/                 # Logging, CSV logger
+└── utils/                 # Logging, CSV logger, visualization overlay
 scripts/                   # CLI tools for processing footage
 tests/                     # Test suite
 models/                    # YOLO and PaddleOCR weights
