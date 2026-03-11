@@ -1,24 +1,32 @@
-import { PrismaClient } from '@prisma/client'
-const prisma = new PrismaClient()
+import { NextResponse } from 'next/server';
+import { prisma } from '@/lib/prisma';
+
 
 export async function POST(request: Request) {
-  const { plate, usdot, unit_id } = await request.json();
+  try {
+    const body = await request.json();
+    console.log("Received from Python:", body);
+    const newEntry = await prisma.truckDetection.create({
+      data: {
+        plateNumber: body.plate || "UNKNOWN",
+        usdotNumber: body.usdot || "UNKNOWN",
+        unitId: body.unit_id || "UNKNOWN",
+      }
+    });
 
-  await prisma.truck_detections.create({
-    data: { 
-      plate_number: plate, 
-      usdot_number: usdot, 
-      unit_id: unit_id 
-    }
-  });
+    return NextResponse.json({ 
+      status: 'success', 
+      dbId: newEntry.id 
+    });
+  } catch (error) {
+    console.error("Database Error:", error);
+    return NextResponse.json(
+      { error: "Failed to save to database", details: error }, 
+      { status: 500 }
+    );
+  }
+}
 
-  const match = await prisma.dock_assignments.findUnique({
-    where: { plate_number: plate }
-  });
-
-  const instructions = match
-    ? `PROCEED TO ${match.assigned_dock}` 
-    : "NO ASSIGNMENT FOUND - GO TO STAGING";
-
-  return Response.json({ instructions });
+export async function GET() {
+  return NextResponse.json({ message: "API is alive and waiting for POST requests." });
 }
