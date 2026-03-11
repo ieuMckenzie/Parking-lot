@@ -37,6 +37,26 @@ class OCRConfig(BaseSettings):
     small_crop_threshold: int = Field(default=150, description="Detections smaller than this (pixels) get extra padding")
     min_confidence: float = Field(default=0.5, description="Minimum OCR confidence to accept a text line")
     container_min_confidence: float = Field(default=0.3, description="Lower OCR confidence threshold for container numbers")
+    max_candidates_per_frame: int = Field(
+        default=3,
+        ge=1,
+        description="Max detections per frame to run through OCR (highest-confidence boxes first)",
+    )
+    lock_after_read_classes: list[str] = Field(
+        default=["USDOT", "LicensePlate", "TrailerNum", "ContainerNum", "ContainerPlate"],
+        description="Classes to stop OCRing after one confident read is captured in the active track",
+    )
+    lock_min_confidence: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="Minimum OCR confidence required before locking a class for the remainder of a track",
+    )
+    every_n_frames: int = Field(
+        default=1,
+        ge=1,
+        description="Run OCR every Nth frame per camera to reduce OCR workload",
+    )
 
 
 class FusionConfig(BaseSettings):
@@ -45,6 +65,15 @@ class FusionConfig(BaseSettings):
     window_seconds: float = Field(default=10.0, description="Inactivity timeout to close a track")
     min_reads: int = Field(default=3, description="Minimum reads for consensus")
     min_confidence: float = Field(default=0.6, description="Minimum total confidence for consensus")
+    duplicate_event_cooldown_seconds: float = Field(
+        default=12.0,
+        ge=0.0,
+        description="Suppress duplicate gate events with the same IDs during this cooldown window",
+    )
+    duplicate_event_key_classes: list[str] = Field(
+        default=["USDOT", "LicensePlate", "TrailerNum"],
+        description="Fusion classes used to build duplicate-event signatures",
+    )
 
 
 class Settings(BaseSettings):

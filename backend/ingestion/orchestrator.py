@@ -5,8 +5,9 @@ import cv2
 import numpy as np
 from sqlmodel import Session
 
+from backend.config import settings
 from backend.decision.handler import handle_track_closed
-from backend.fusion.models import Read
+from backend.fusion.models import FusionResult, Read
 from backend.fusion.pipeline import Annotation, process_frame
 from backend.fusion.tracker import TrackManager
 from backend.ingestion.camera import CameraSource
@@ -37,6 +38,7 @@ class GateOrchestrator:
         output_path: str | None = None,
         quiet: bool = False,
         show_banner: bool = True,
+        ocr_every_n_frames: int = 1,
     ):
         self._cameras = cameras
         self._detector = detector
@@ -51,6 +53,11 @@ class GateOrchestrator:
         self._video_writer: cv2.VideoWriter | None = None
         self._quiet = quiet
         self._show_banner = show_banner
+        self._ocr_every_n_frames = max(1, ocr_every_n_frames)
+        self._camera_frame_counts: dict[str, int] = {cam.camera_id: 0 for cam in cameras}
+        self._duplicate_cooldown = settings.fusion.duplicate_event_cooldown_seconds
+        self._duplicate_key_classes = set(settings.fusion.duplicate_event_key_classes)
+        self._recent_event_signatures: dict[tuple[str, ...], float] = {}
 
         self._motion_detectors: dict[str, MotionDetector] = {}
         if use_motion:
@@ -123,6 +130,8 @@ class GateOrchestrator:
                     continue
 
                 frame, timestamp = frame_data
+                self._camera_frame_counts[cam.camera_id] = self._camera_frame_counts.get(cam.camera_id, 0) + 1
+                frame_count = self._camera_frame_counts[cam.camera_id]
 
                 # Keep latest frame for display (even if motion-skipped)
                 if self._display or self._output_path:
@@ -132,9 +141,22 @@ class GateOrchestrator:
                 if motion_det and not motion_det.has_motion(frame):
                     continue
 
+                run_ocr = (frame_count - 1) % self._ocr_every_n_frames == 0
+
+                lock_classes = set(settings.ocr.lock_after_read_classes)
+                lock_min_conf = settings.ocr.lock_min_confidence
+                skip_ocr_classes: set[str] = set()
+                active_track = self._track_manager.active_track
+                if active_track is not None:
+                    for read in active_track.reads:
+                        if read.class_name in lock_classes and read.confidence >= lock_min_conf:
+                            skip_ocr_classes.add(read.class_name)
+
                 reads, annotations = process_frame(
                     frame, self._detector, self._ocr,
                     camera_id=cam.camera_id, timestamp=timestamp,
+                    skip_ocr_classes=skip_ocr_classes,
+                    run_ocr=run_ocr,
                 )
                 all_reads.extend(reads)
                 all_annotations.extend(annotations)
@@ -154,13 +176,15 @@ class GateOrchestrator:
             decision_text = None
             if result is not None:
                 track = self._track_manager.completed[-1][0]
+                is_duplicate = self._is_duplicate_event(result, now)
                 event = handle_track_closed(
                     track_id=track.id, results=result, session=self._session,
                 )
-                self._print_event(event)
-                decision_text = event.decision.value
-                self._last_decision = decision_text
-                self._decision_expire = time.monotonic() + 3.0
+                if not is_duplicate:
+                    self._print_event(event)
+                    decision_text = event.decision.value
+                    self._last_decision = decision_text
+                    self._decision_expire = time.monotonic() + 3.0
 
             # Render display / output
             if display_frame is not None and (self._display or self._output_path):
@@ -205,10 +229,13 @@ class GateOrchestrator:
         result = self._track_manager.flush()
         if result is not None:
             track = self._track_manager.completed[-1][0]
+            now = time.time()
+            is_duplicate = self._is_duplicate_event(result, now)
             event = handle_track_closed(
                 track_id=track.id, results=result, session=self._session,
             )
-            self._print_event(event, final=True)
+            if not is_duplicate:
+                self._print_event(event, final=True)
 
         if self._video_writer is not None:
             self._video_writer.release()
@@ -234,3 +261,27 @@ class GateOrchestrator:
         if event.trailer_number:
             print(f"  Trailer:  {event.trailer_number}")
         print()
+
+    def _is_duplicate_event(self, results: list[FusionResult], now: float) -> bool:
+        if self._duplicate_cooldown <= 0:
+            return False
+
+        # Build signature from configured identity classes.
+        parts = sorted(
+            f"{r.class_name}:{r.value}"
+            for r in results
+            if r.class_name in self._duplicate_key_classes and r.value
+        )
+        if not parts:
+            return False
+
+        signature = tuple(parts)
+
+        # Prune expired signatures to keep memory bounded.
+        expired = [sig for sig, seen_at in self._recent_event_signatures.items() if (now - seen_at) > self._duplicate_cooldown]
+        for sig in expired:
+            del self._recent_event_signatures[sig]
+
+        last_seen = self._recent_event_signatures.get(signature)
+        self._recent_event_signatures[signature] = now
+        return last_seen is not None and (now - last_seen) <= self._duplicate_cooldown

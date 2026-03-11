@@ -287,6 +287,7 @@ def main():
     parser.add_argument("input", help="Video file or image directory")
     parser.add_argument("-m", "--model", default="models/paddle/my_model.pt", help="YOLO model path")
     parser.add_argument("-c", "--confidence", type=float, default=0.25, help="Detection confidence threshold")
+    parser.add_argument("--device", choices=["auto", "cpu", "gpu"], default="auto", help="Inference device for YOLO and OCR")
     parser.add_argument("--csv", default=None, help="CSV output path for per-frame reads")
     parser.add_argument("--db", default=None, help="SQLite database path (default: in-memory)")
     parser.add_argument("--timeout", type=float, default=5.0, help="Fusion track timeout in seconds (default: 5)")
@@ -322,9 +323,9 @@ def main():
 
     # Initialize models
     print(f"Loading YOLO model: {args.model}")
-    detector = Detector(model_path=args.model, confidence=args.confidence)
+    detector = Detector(model_path=args.model, confidence=args.confidence, device=args.device)
     print("Loading PaddleOCR engine...")
-    ocr = OCREngine()
+    ocr = OCREngine(device=args.device)
 
     track_manager = TrackManager(timeout=args.timeout)
 

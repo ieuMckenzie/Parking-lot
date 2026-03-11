@@ -88,10 +88,14 @@ class VideoCamera(CameraSource):
         path: Path,
         camera_id: str = "video",
         realtime: bool = False,
+        drop_frames: bool = False,
+        max_lag_seconds: float = 0.25,
     ):
         self._path = path
         self._camera_id = camera_id
         self._realtime = realtime
+        self._drop_frames = drop_frames
+        self._max_lag_seconds = max(0.0, max_lag_seconds)
         self._cap: cv2.VideoCapture | None = None
         self._fps: float = 30.0
         self._frame_idx: int = 0
@@ -131,6 +135,16 @@ class VideoCamera(CameraSource):
             elapsed = time.monotonic() - self._start_time
             if elapsed < target_time:
                 time.sleep(target_time - elapsed)
+            elif self._drop_frames:
+                lag = elapsed - target_time
+                if lag > self._max_lag_seconds:
+                    # Drop old frames to keep playback close to wall clock time.
+                    frames_to_skip = int((lag - self._max_lag_seconds) * self._fps)
+                    for _ in range(frames_to_skip):
+                        if not self._cap.grab():
+                            self._exhausted = True
+                            return None
+                    self._frame_idx += frames_to_skip
 
         ret, frame = self._cap.read()
         if not ret:
@@ -246,7 +260,13 @@ class WebcamCamera(ThreadedCamera):
         self._running = False
 
 
-def parse_source(spec: str, index: int, realtime: bool = False) -> CameraSource:
+def parse_source(
+    spec: str,
+    index: int,
+    realtime: bool = False,
+    drop_frames: bool = False,
+    max_lag_seconds: float = 0.25,
+) -> CameraSource:
     """Parse a source specifier string into a CameraSource."""
     camera_id = f"cam{index}"
     if spec.startswith("rtsp://"):
@@ -258,4 +278,10 @@ def parse_source(spec: str, index: int, realtime: bool = False) -> CameraSource:
         folder = Path(spec.split(":", 1)[1])
         return ImageFolderCamera(folder=folder, camera_id=camera_id)
     else:
-        return VideoCamera(path=Path(spec), camera_id=camera_id, realtime=realtime)
+        return VideoCamera(
+            path=Path(spec),
+            camera_id=camera_id,
+            realtime=realtime,
+            drop_frames=drop_frames,
+            max_lag_seconds=max_lag_seconds,
+        )

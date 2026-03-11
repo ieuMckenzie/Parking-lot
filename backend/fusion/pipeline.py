@@ -33,6 +33,8 @@ def process_frame(
     camera_id: str,
     timestamp: float,
     padding_ratio: float = 0.2,
+    skip_ocr_classes: set[str] | None = None,
+    run_ocr: bool = True,
 ) -> FrameResult:
     """Run detection + OCR on a single frame, return validated Reads and annotations."""
     detections = detector.detect(frame)
@@ -43,8 +45,29 @@ def process_frame(
     small_threshold = settings.ocr.small_crop_threshold
     small_padding = settings.ocr.small_crop_padding
     container_min_conf = settings.ocr.container_min_confidence
+    max_candidates = settings.ocr.max_candidates_per_frame
 
-    for det in detections:
+    ocr_indices: set[int]
+    if len(detections) <= max_candidates:
+        ocr_indices = set(range(len(detections)))
+    else:
+        # OCR is expensive; prioritize highest-confidence detections each frame.
+        ranked = sorted(enumerate(detections), key=lambda item: item[1].confidence, reverse=True)
+        ocr_indices = {idx for idx, _ in ranked[:max_candidates]}
+
+    skip_ocr_classes = skip_ocr_classes or set()
+
+    for idx, det in enumerate(detections):
+        if (not run_ocr) or idx not in ocr_indices or det.class_name in skip_ocr_classes:
+            annotations.append(Annotation(
+                bbox=det.bbox,
+                class_name=det.class_name,
+                text="",
+                confidence=det.confidence,
+                det_confidence=det.confidence,
+            ))
+            continue
+
         # Use larger padding for small detections to give OCR more context
         bbox_w = det.bbox[2] - det.bbox[0]
         bbox_h = det.bbox[3] - det.bbox[1]

@@ -41,10 +41,14 @@ def main():
     parser.add_argument("sources", nargs="+", help="Camera sources (rtsp://..., webcam:N, images:path, or video file)")
     parser.add_argument("-m", "--model", default="models/paddle/my_model.pt", help="YOLO model path")
     parser.add_argument("-c", "--confidence", type=float, default=0.25, help="Detection confidence threshold")
+    parser.add_argument("--device", choices=["auto", "cpu", "gpu"], default="auto", help="Inference device for YOLO and OCR")
     parser.add_argument("--csv", default=None, help="CSV output path for per-frame reads")
     parser.add_argument("--db", default=None, help="SQLite database path (default: in-memory)")
     parser.add_argument("--timeout", type=float, default=5.0, help="Fusion track timeout in seconds")
+    parser.add_argument("--ocr-every", type=int, default=settings.ocr.every_n_frames, help="Run OCR every Nth frame per camera")
     parser.add_argument("--realtime", action="store_true", help="Play video files at real-time speed")
+    parser.add_argument("--drop-frames", action="store_true", help="When behind in realtime mode, drop stale video frames to catch up")
+    parser.add_argument("--max-lag-ms", type=int, default=250, help="Allowed lag before dropping frames in realtime mode")
     parser.add_argument("--no-motion", action="store_true", help="Disable motion detection filter")
     parser.add_argument("--display", action="store_true", help="Show live OpenCV window with annotations")
     parser.add_argument("--output", default=None, metavar="PATH", help="Write annotated video to file (e.g. output.mp4)")
@@ -73,14 +77,24 @@ def main():
         print(f"Allowlist: {field_type} = {value}")
 
     # Parse camera sources
-    cameras = [parse_source(spec, i, args.realtime) for i, spec in enumerate(args.sources)]
+    max_lag_seconds = max(0.0, args.max_lag_ms / 1000.0)
+    cameras = [
+        parse_source(
+            spec,
+            i,
+            args.realtime,
+            drop_frames=args.drop_frames,
+            max_lag_seconds=max_lag_seconds,
+        )
+        for i, spec in enumerate(args.sources)
+    ]
     print(f"Camera sources: {[f'{type(c).__name__}({c.camera_id})' for c in cameras]}")
 
     # Load models
     print(f"Loading YOLO model: {args.model}")
-    detector = Detector(model_path=args.model, confidence=args.confidence)
+    detector = Detector(model_path=args.model, confidence=args.confidence, device=args.device)
     print("Loading PaddleOCR engine...")
-    ocr = OCREngine()
+    ocr = OCREngine(device=args.device)
 
     # Build orchestrator
     track_manager = TrackManager(timeout=args.timeout)
@@ -98,6 +112,7 @@ def main():
         output_path=args.output,
         quiet=args.quiet,
         show_banner=not args.no_banner,
+        ocr_every_n_frames=max(1, args.ocr_every),
     )
 
     quit_hint = " Press Q to quit." if args.display else " Press Ctrl+C to stop."
