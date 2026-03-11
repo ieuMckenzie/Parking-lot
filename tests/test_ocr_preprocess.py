@@ -11,9 +11,9 @@ class FakePredictResult:
         self._lines = lines
 
     def __getitem__(self, key):
-        if key == "rec_text":
+        if key == "rec_texts":
             return [t for t, s in self._lines]
-        if key == "rec_score":
+        if key == "rec_scores":
             return [s for t, s in self._lines]
         raise KeyError(key)
 

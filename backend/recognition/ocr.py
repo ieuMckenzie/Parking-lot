@@ -35,14 +35,14 @@ class OCREngine:
         The preprocess parameter is accepted for backward compatibility but is
         a no-op — PP-OCRv5 handles its own preprocessing internally.
         """
-        output = self.model.predict(input=crop, batch_size=1)
+        output = self.model.predict(input=crop)
 
         texts: list[str] = []
         scores: list[float] = []
 
         for res in output:
-            rec_texts = res["rec_text"]
-            rec_scores = res["rec_score"]
+            rec_texts = res["rec_texts"]
+            rec_scores = res["rec_scores"]
             for text, score in zip(rec_texts, rec_scores):
                 if score >= self.min_confidence and text.strip():
                     texts.append(text.strip())
