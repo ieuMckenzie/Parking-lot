@@ -1,16 +1,19 @@
 import signal
 import time
 
+import cv2
+import numpy as np
 from sqlmodel import Session
 
 from backend.decision.handler import handle_track_closed
 from backend.fusion.models import Read
-from backend.fusion.pipeline import process_frame
+from backend.fusion.pipeline import Annotation, process_frame
 from backend.fusion.tracker import TrackManager
 from backend.ingestion.camera import CameraSource
 from backend.ingestion.motion import MotionDetector
 from backend.utils.csv_logger import append_reads
 from backend.utils.logging import get_logger
+from backend.utils.visualization import draw_annotations, draw_status
 
 log = get_logger("orchestrator")
 
@@ -30,6 +33,8 @@ class GateOrchestrator:
         motion_warmup: int = 30,
         csv_path: str | None = None,
         processing_fps: float = 10.0,
+        display: bool = False,
+        output_path: str | None = None,
     ):
         self._cameras = cameras
         self._detector = detector
@@ -39,6 +44,9 @@ class GateOrchestrator:
         self._csv_path = csv_path
         self._min_interval = 1.0 / processing_fps if processing_fps > 0 else 0
         self._running = False
+        self._display = display
+        self._output_path = output_path
+        self._video_writer: cv2.VideoWriter | None = None
 
         self._motion_detectors: dict[str, MotionDetector] = {}
         if use_motion:
@@ -46,6 +54,11 @@ class GateOrchestrator:
                 self._motion_detectors[cam.camera_id] = MotionDetector(
                     threshold=motion_threshold, warmup_frames=motion_warmup,
                 )
+
+        # Display state
+        self._last_decision: str | None = None
+        self._decision_expire: float = 0.0
+        self._fps_smooth: float = 0.0
 
     def start(self) -> None:
         """Start all cameras and run the processing loop."""
@@ -79,12 +92,22 @@ class GateOrchestrator:
         log.info("shutdown_signal", signal=signum)
         self._running = False
 
+    def _init_video_writer(self, frame: np.ndarray) -> None:
+        if self._video_writer is not None or self._output_path is None:
+            return
+        h, w = frame.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self._video_writer = cv2.VideoWriter(self._output_path, fourcc, 10.0, (w, h))
+        log.info("video_writer_started", path=self._output_path, size=f"{w}x{h}")
+
     def _run_loop(self) -> None:
         while self._running:
             loop_start = time.monotonic()
             all_reads: list[Read] = []
+            all_annotations: list[Annotation] = []
             now = time.time()
             any_active = False
+            display_frame: np.ndarray | None = None
 
             for cam in self._cameras:
                 if not cam.active:
@@ -97,15 +120,20 @@ class GateOrchestrator:
 
                 frame, timestamp = frame_data
 
+                # Keep latest frame for display (even if motion-skipped)
+                if self._display or self._output_path:
+                    display_frame = frame
+
                 motion_det = self._motion_detectors.get(cam.camera_id)
                 if motion_det and not motion_det.has_motion(frame):
                     continue
 
-                reads = process_frame(
+                reads, annotations = process_frame(
                     frame, self._detector, self._ocr,
                     camera_id=cam.camera_id, timestamp=timestamp,
                 )
                 all_reads.extend(reads)
+                all_annotations.extend(annotations)
 
             if not any_active:
                 log.info("all_cameras_exhausted")
@@ -118,12 +146,46 @@ class GateOrchestrator:
                          texts=[f"{r.class_name}={r.text}" for r in all_reads])
 
             result = self._track_manager.update(all_reads, now=now)
+            decision_text = None
             if result is not None:
                 track = self._track_manager.completed[-1][0]
                 event = handle_track_closed(
                     track_id=track.id, results=result, session=self._session,
                 )
                 self._print_event(event)
+                decision_text = event.decision.value
+                self._last_decision = decision_text
+                self._decision_expire = time.monotonic() + 3.0
+
+            # Render display / output
+            if display_frame is not None and (self._display or self._output_path):
+                elapsed = time.monotonic() - loop_start
+                current_fps = 1.0 / elapsed if elapsed > 0 else 0.0
+                self._fps_smooth = 0.8 * self._fps_smooth + 0.2 * current_fps
+
+                active_track = self._track_manager.active_track
+                track_reads = len(active_track.reads) if active_track else 0
+
+                banner = self._last_decision if time.monotonic() < self._decision_expire else None
+
+                annotated = draw_annotations(display_frame, all_annotations)
+                annotated = draw_status(
+                    annotated,
+                    decision=banner,
+                    fps=self._fps_smooth,
+                    track_reads=track_reads,
+                )
+
+                if self._display:
+                    cv2.imshow("GateVision", annotated)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q"):
+                        self._running = False
+
+                if self._output_path:
+                    self._init_video_writer(annotated)
+                    if self._video_writer is not None:
+                        self._video_writer.write(annotated)
 
             elapsed = time.monotonic() - loop_start
             if elapsed < self._min_interval:
@@ -142,6 +204,13 @@ class GateOrchestrator:
                 track_id=track.id, results=result, session=self._session,
             )
             self._print_event(event, final=True)
+
+        if self._video_writer is not None:
+            self._video_writer.release()
+            log.info("video_writer_closed", path=self._output_path)
+
+        if self._display:
+            cv2.destroyAllWindows()
 
         log.info("orchestrator_stopped",
                  tracks_completed=len(self._track_manager.completed))

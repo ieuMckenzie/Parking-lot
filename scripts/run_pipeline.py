@@ -126,7 +126,7 @@ def process_video(
         if _verbose:
             reads = process_frame_verbose(frame, detector, ocr, camera_id, timestamp, label=f"Frame {idx}:")
         else:
-            reads = process_frame(frame, detector, ocr, camera_id, timestamp)
+            reads, _ = process_frame(frame, detector, ocr, camera_id, timestamp)
 
         if reads:
             if not _verbose:
@@ -195,7 +195,7 @@ def process_image(
     if _verbose:
         reads = process_frame_verbose(frame, detector, ocr, camera_id, timestamp=0.0)
     else:
-        reads = process_frame(frame, detector, ocr, camera_id, timestamp=0.0)
+        reads, _ = process_frame(frame, detector, ocr, camera_id, timestamp=0.0)
     if reads:
         if not _verbose:
             for r in reads:
@@ -250,7 +250,7 @@ def process_images(
         if _verbose:
             reads = process_frame_verbose(frame, detector, ocr, camera_id, timestamp, label=f"{img_path.name}:")
         else:
-            reads = process_frame(frame, detector, ocr, camera_id, timestamp)
+            reads, _ = process_frame(frame, detector, ocr, camera_id, timestamp)
 
         if reads:
             if not _verbose:

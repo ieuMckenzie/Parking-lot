@@ -49,7 +49,7 @@ def test_process_frame_produces_reads():
     detector = FakeDetector(detections)
     ocr = FakeOCR({"USDOT": ("1234567", 0.92)})
 
-    reads = process_frame(
+    reads, annotations = process_frame(
         frame=frame,
         detector=detector,
         ocr=ocr,
@@ -61,6 +61,8 @@ def test_process_frame_produces_reads():
     assert reads[0].text == "1234567"
     assert reads[0].class_name == "USDOT"
     assert reads[0].camera_id == "cam1"
+    assert len(annotations) == 1
+    assert annotations[0].class_name == "USDOT"
 
 
 def test_process_frame_filters_invalid_ocr():
@@ -72,7 +74,7 @@ def test_process_frame_filters_invalid_ocr():
     # "AB" is too short to be a valid USDOT
     ocr = FakeOCR({"USDOT": ("AB", 0.5)})
 
-    reads = process_frame(
+    reads, annotations = process_frame(
         frame=frame,
         detector=detector,
         ocr=ocr,
@@ -81,6 +83,8 @@ def test_process_frame_filters_invalid_ocr():
         padding_ratio=0.2,
     )
     assert len(reads) == 0
+    # Annotation still present even though read was filtered
+    assert len(annotations) == 1
 
 
 def test_process_frame_no_detections():
@@ -88,7 +92,7 @@ def test_process_frame_no_detections():
     detector = FakeDetector([])
     ocr = FakeOCR({})
 
-    reads = process_frame(
+    reads, annotations = process_frame(
         frame=frame,
         detector=detector,
         ocr=ocr,
@@ -96,3 +100,4 @@ def test_process_frame_no_detections():
         timestamp=100.0,
     )
     assert reads == []
+    assert annotations == []
