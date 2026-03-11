@@ -67,6 +67,7 @@ parser.add_argument('--ocr-workers', help='Number of OCR threads', type=int, def
 parser.add_argument('--ocr-debug', help='Print OCR diagnostics (raw results, candidates, why no match)', action='store_true')
 parser.add_argument('--ocr-upscale', help='Upscale crop by this factor before OCR (e.g. 2.0 = double size)', type=float, default=None)
 parser.add_argument('--no-enhance-feed', help='Disable frame enhancement (contrast + sharpen) for a raw feed', action='store_true')
+parser.add_argument('--draw-all', help='Draw all YOLO classes above threshold, even if not in target class list', action='store_true')
 args = parser.parse_args()
 
 model_path = args.model
@@ -76,6 +77,7 @@ record = args.record
 grid_cols = args.grid_cols
 num_ocr_workers = max(1, args.ocr_workers)
 ocr_debug = args.ocr_debug
+draw_all = args.draw_all
 if args.ocr_upscale is not None:
     OCR_UPSCALE = max(0.25, min(4.0, args.ocr_upscale))
 if args.no_enhance_feed:
@@ -331,6 +333,7 @@ class CameraCapture:
         self.fps = 0.0
         self.last_frame_time = 0
         self.is_connected = False # FIX: Prevents spamming
+        self.static_image = None
 
     def start(self):
         self.running = True
@@ -343,6 +346,24 @@ class CameraCapture:
     def _capture_loop(self):
         last_saved_time = 0
         while self.running:
+            if self.static_image is not None:
+                now = time.time()
+                if (now - last_saved_time) >= self.frame_interval:
+                    frame = self.static_image.copy()
+                    if self.resolution:
+                        frame = cv2.resize(frame, self.resolution)
+
+                    if self.last_frame_time > 0:
+                        self.fps = 1.0 / max(0.001, now - self.last_frame_time)
+                    self.last_frame_time = now
+
+                    with self.buffer_lock:
+                        self.frame_buffer.append((frame, now))
+
+                    last_saved_time = now
+                time.sleep(0.005)
+                continue
+
             if not self.cap or not self.cap.isOpened():
                 self.is_connected = False
                 self._connect()
@@ -373,6 +394,18 @@ class CameraCapture:
     def _connect(self):
         try:
             src = self.source_spec
+
+            if os.path.isfile(src):
+                ext = os.path.splitext(src)[1].lower()
+                if ext in {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp'}:
+                    img = cv2.imread(src)
+                    if img is not None:
+                        self.static_image = img
+                        if not self.is_connected:
+                            print(f"System: Loaded {self.camera_id}")
+                            self.is_connected = True
+                    return
+
             if 'usb' in src.lower(): self.cap = cv2.VideoCapture(int(src.replace('usb', '')))
             elif src.isdigit(): self.cap = cv2.VideoCapture(int(src))
             else: self.cap = cv2.VideoCapture(src)
@@ -399,6 +432,7 @@ class CameraCapture:
 yolo_input_queue = queue.Queue(maxsize=4)
 _yolo_reported = {}
 YOLO_PRINT_COOLDOWN = 5.0
+TARGET_LABEL_HINTS = ['usdot', 'trailernum', 'containernum', 'containerplate', 'licenseplate']
 
 def yolo_worker():
     global _yolo_reported
@@ -420,18 +454,20 @@ def yolo_worker():
                 cls_id = int(box.cls)
                 
                 raw_label = labels[cls_id] if cls_id < len(labels) else "unknown"
-                label_key = raw_label.lower().replace(' ', '_')
-                req_conf = CLASS_THRESHOLDS.get(label_key, global_min_thresh)
+                label_key = raw_label.lower().replace(' ', '_').replace('-', '_')
+                label_norm = re.sub(r'[^a-z0-9]', '', raw_label.lower())
+                req_conf = CLASS_THRESHOLDS.get(label_norm, CLASS_THRESHOLDS.get(label_key, global_min_thresh))
+                is_target = any(t in label_norm for t in TARGET_LABEL_HINTS)
                 
                 if conf > req_conf:
-                    # FIX: Targets must be lowercase now
-                    targets = ['usdot', 'trailernum', 'containerplate', 'licenseplate', 'containernum']
-                    if any(t in label_key for t in targets):
+                    if is_target or draw_all:
                         bid = f"{x1}_{y1}"
                         detections.append({
                             'rect': (x1, y1, x2, y2),
                             'bid': bid,
                             'label': label_key,
+                            'raw_label': raw_label,
+                            'is_target': is_target,
                             'conf': conf
                         })
                         report_key = (cam_id, bid, label_key)
@@ -443,6 +479,8 @@ def yolo_worker():
             
             # OCR Handoff
             for det in detections:
+                if not det.get('is_target', True):
+                    continue
                 bid = det['bid']
                 txt, _ = shared_state.get_display_text(cam_id, bid)
                 if txt is None:
@@ -699,8 +737,12 @@ try:
                 bid = det['bid']
                 txt, col = shared_state.get_display_text(cid, bid)
                 if txt is None:
-                    txt = "Scanning..."
-                    col = (255, 165, 0)
+                    if det.get('is_target', True):
+                        txt = "Scanning..."
+                        col = (255, 165, 0)
+                    else:
+                        txt = f"{det.get('raw_label', det['label'])}: {det['conf']:.2f}"
+                        col = (0, 255, 255)
                 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
                 cv2.putText(frame, txt, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)

@@ -19,6 +19,7 @@ from difflib import SequenceMatcher
 import cv2
 import numpy as np
 from paddleocr import PaddleOCR
+import easyocr
 from ultralytics import YOLO
 
 # --- CONFIGURATION ---
@@ -70,6 +71,7 @@ parser.add_argument('--ocr-workers', help='Number of OCR threads', type=int, def
 parser.add_argument('--ocr-debug', help='Print OCR diagnostics', action='store_true')
 parser.add_argument('--use-gpu', help='Enable GPU for PaddleOCR', action='store_true')
 parser.add_argument('--no-enhance-feed', help='Disable frame enhancement', action='store_true')
+parser.add_argument('--low-latency', help='Reduce queueing and OCR work for faster box updates', action='store_true')
 args = parser.parse_args()
 
 model_path = args.model
@@ -80,6 +82,13 @@ grid_cols = args.grid_cols
 num_ocr_workers = max(1, args.ocr_workers)
 ocr_debug = args.ocr_debug
 use_gpu = args.use_gpu
+low_latency = args.low_latency
+
+if low_latency:
+    FEED_ENHANCE = False
+    OCR_UPSCALE = 1.5
+    OCR_UPSCALE_SMALL = 2.0
+    num_ocr_workers = 1
 
 if args.no_enhance_feed:
     FEED_ENHANCE = False
@@ -96,7 +105,17 @@ labels = model.names
 
 print(f"Initializing PaddleOCR (GPU={use_gpu})...")
 # PaddleOCR 3.x: only lang is supported; use_gpu/show_log/det_* are not in this API
-reader = PaddleOCR(lang='en')
+ocr_backend = 'paddle'
+try:
+    reader = PaddleOCR(lang='en')
+except Exception as e:
+    print(f"PaddleOCR init failed: {e}")
+    print("Falling back to EasyOCR (CPU).")
+    ocr_backend = 'easyocr'
+    try:
+        reader = easyocr.Reader(['en'], gpu=False)
+    except Exception as e2:
+        sys.exit(f"ERROR: Could not initialize any OCR backend. Paddle error: {e} | EasyOCR error: {e2}")
 
 log_filename = 'truck_logistics.csv'
 authorized_plates = set()
@@ -271,6 +290,36 @@ def _run_readtext(processed_img):
         img = cv2.cvtColor(processed_img, cv2.COLOR_GRAY2BGR)
     else:
         img = processed_img
+
+    if ocr_backend == 'easyocr':
+        out = []
+        try:
+            result = reader.readtext(img, detail=1, paragraph=False)
+        except Exception:
+            return []
+        for row in result:
+            if not row or len(row) < 3:
+                continue
+            box_raw, text_raw, conf_raw = row[0], row[1], row[2]
+            text = str(text_raw).strip()
+            if not text:
+                continue
+            try:
+                conf = float(conf_raw)
+            except (ValueError, TypeError):
+                conf = 0.5
+            conf = max(0.0, min(1.0, conf))
+            try:
+                box = np.array(box_raw, dtype=np.float64)
+                if box.ndim == 1 and box.size >= 4:
+                    box = box.reshape(-1, 2)
+                if box.ndim < 2 or box.size < 4:
+                    continue
+            except (ValueError, TypeError):
+                continue
+            out.append((box, text, conf))
+        return out
+
     result = reader.ocr(img)
     if not result or result[0] is None:
         return []
@@ -362,6 +411,33 @@ def _bbox_x0(item):
     except (IndexError, TypeError):
         return 0.0
 
+def _sanitize_ocr_results(results):
+    cleaned = []
+    if not results:
+        return cleaned
+    for item in results:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+        box_raw, text_raw, conf_raw = item[0], item[1], item[2]
+        text = str(text_raw).strip() if text_raw is not None else ""
+        if not text:
+            continue
+        try:
+            box = np.array(box_raw, dtype=np.float64)
+            if box.ndim == 1 and box.size >= 4:
+                box = box.reshape(-1, 2)
+            if box.ndim < 2 or len(box) == 0:
+                continue
+        except (ValueError, TypeError):
+            continue
+        try:
+            conf = float(conf_raw)
+        except (ValueError, TypeError):
+            conf = 0.0
+        conf = max(0.0, min(1.0, conf))
+        cleaned.append((box, text, conf))
+    return cleaned
+
 def clean_text(text): return re.sub(r'[^A-Z0-9\-]', '', text.upper())
 
 def enhance_frame(frame):
@@ -389,6 +465,7 @@ class CameraCapture:
         self.buffer_lock = threading.Lock()
         self.running = False
         self.cap = None
+        self.static_image = None
         self.fps = 0.0
         self.last_frame_time = 0
         self.is_connected = False
@@ -407,6 +484,24 @@ class CameraCapture:
         is_file_source = isinstance(self.source_spec, str) and os.path.isfile(self.source_spec)
         next_frame_time = 0.0
         while self.running:
+            if self.static_image is not None:
+                now = time.time()
+                if (now - last_saved_time) >= self.frame_interval:
+                    frame = self.static_image.copy()
+                    if self.resolution:
+                        frame = cv2.resize(frame, self.resolution)
+
+                    if self.last_frame_time > 0:
+                        self.fps = 1.0 / max(0.001, now - self.last_frame_time)
+                    self.last_frame_time = now
+
+                    with self.buffer_lock:
+                        self.frame_buffer.append((frame, now))
+
+                    last_saved_time = now
+                time.sleep(0.005)
+                continue
+
             if not self.cap or not self.cap.isOpened():
                 self.is_connected = False
                 self._connect()
@@ -451,6 +546,18 @@ class CameraCapture:
     def _connect(self):
         try:
             src = self.source_spec
+
+            if os.path.isfile(src):
+                ext = os.path.splitext(src)[1].lower()
+                if ext in {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp'}:
+                    img = cv2.imread(src)
+                    if img is not None:
+                        self.static_image = img
+                        if not self.is_connected:
+                            print(f"System: Loaded {self.camera_id}")
+                            self.is_connected = True
+                    return
+
             if 'usb' in src.lower(): self.cap = cv2.VideoCapture(int(src.replace('usb', '')))
             elif src.isdigit(): self.cap = cv2.VideoCapture(int(src))
             else: self.cap = cv2.VideoCapture(src)
@@ -479,9 +586,21 @@ class CameraCapture:
         return None, 0
 
 # --- YOLO WORKER ---
-yolo_input_queue = queue.Queue(maxsize=4)
+yolo_input_queue = queue.Queue(maxsize=1 if low_latency else 4)
 _yolo_reported = {}
 YOLO_PRINT_COOLDOWN = 5.0
+
+def _put_latest(q, item):
+    if q.full():
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            pass
+    try:
+        q.put_nowait(item)
+        return True
+    except queue.Full:
+        return False
 
 def yolo_worker():
     global _yolo_reported
@@ -542,7 +661,7 @@ def yolo_worker():
                         crop = frame[max(0, y1-py):min(h, y2+py), max(0, x1-px):min(w, x2+px)]
                         
                         if crop.size > 0:
-                            ocr_queue.put((crop, det['conf'], bid, cam_id, det['label']))
+                            _put_latest(ocr_queue, (crop, det['conf'], bid, cam_id, det['label']))
 
             yolo_input_queue.task_done()
         except queue.Empty: continue
@@ -575,7 +694,7 @@ class GridDisplay:
         return canvas
 
 # --- OCR WORKER (OPTIMIZED FLOW) ---
-ocr_queue = queue.Queue(maxsize=10 * num_cameras)
+ocr_queue = queue.Queue(maxsize=(3 if low_latency else 10) * num_cameras)
 _last_ocr_error = None
 _last_ocr_error_time = 0
 OCR_ERROR_COOLDOWN = 10.0
@@ -600,13 +719,13 @@ def ocr_worker(wid):
 
             # --- STRATEGY 1: LIGHT (Fastest) ---
             processed_light = preprocess_for_ocr_light(img_crop)
-            results = _run_readtext(processed_light)
+            results = _sanitize_ocr_results(_run_readtext(processed_light))
             avg_conf = get_avg_conf(results)
 
             # --- STRATEGY 2: HEAVY (Only if needed) ---
-            if not results or avg_conf < 0.85:
+            if (not low_latency) and (not results or avg_conf < 0.85):
                 processed = preprocess_for_ocr(img_crop, use_binarization=False)
-                results_heavy = _run_readtext(processed)
+                results_heavy = _sanitize_ocr_results(_run_readtext(processed))
                 if get_avg_conf(results_heavy) > avg_conf:
                     results = results_heavy
 
@@ -614,7 +733,7 @@ def ocr_worker(wid):
             is_plate = class_type in ('licenseplate', 'containerplate')
             if is_plate and (not results or get_avg_conf(results) < 0.60):
                 processed_bin = preprocess_for_ocr(img_crop, use_binarization=True)
-                results_bin = _run_readtext(processed_bin)
+                results_bin = _sanitize_ocr_results(_run_readtext(processed_bin))
                 if get_avg_conf(results_bin) > get_avg_conf(results):
                     results = results_bin
 
@@ -725,8 +844,7 @@ try:
             if FEED_ENHANCE: frame = enhance_frame(frame)
             fps_map[cid] = cam.fps
             
-            if not yolo_input_queue.full():
-                yolo_input_queue.put((frame, cid))
+            _put_latest(yolo_input_queue, (frame, cid))
 
             detections = shared_state.get_detections(cid)
 
