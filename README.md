@@ -13,10 +13,42 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 
 # Install dependencies
 uv sync
-
-# Optional: create .env for config overrides
-cp .env.example .env
 ```
+# Live / Multi-Camera Mode
+
+The `scripts/run_live.py` script runs the full pipeline continuously on one or more camera sources (RTSP streams, video files, webcams, or image folders).
+
+### Basic Usage
+
+```bash
+# Single video file
+uv run python -m scripts.run_live data/DOT.mp4 --no-motion --csv detections.csv
+
+# Multiple video files as simulated cameras
+uv run python -m scripts.run_live video1.mp4 video2.mp4 --no-motion
+
+# RTSP cameras
+uv run python -m scripts.run_live rtsp://host/cam1 rtsp://host/cam2
+
+# USB webcam
+uv run python -m scripts.run_live webcam:0
+
+# Image folder
+uv run python -m scripts.run_live images:data/frames/
+```
+
+### All Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-m, --model` | `models/paddle/my_model.pt` | YOLO model weights path |
+| `-c, --confidence` | `0.25` | Detection confidence threshold |
+| `--csv` | _(disabled)_ | CSV output path for per-frame reads |
+| `--db` | _(in-memory)_ | SQLite database file path |
+| `--timeout` | `5.0` | Fusion track timeout in seconds |
+| `--realtime` | _(off)_ | Play video files at real-time speed |
+| `--no-motion` | _(off)_ | Disable motion detection filter |
+| `--allow TYPE:VALUE` | _(none)_ | Seed an allowlist entry (repeatable) |
 
 ## Running the Pipeline
 
@@ -98,7 +130,7 @@ backend/
 ├── decision/              # Allowlist CRUD, decision engine, track close handler
 ├── detection/             # YOLO detector wrapper
 ├── fusion/                # Temporal fusion (tracker, voter, pipeline)
-├── recognition/           # PaddleOCR 3.x wrapper + regex postprocessing
+├── recognition/           # PaddleOCR 3.x full pipeline (det+rec) + regex postprocessing
 └── utils/                 # Logging, CSV logger
 scripts/                   # CLI tools for processing footage
 tests/                     # Test suite
