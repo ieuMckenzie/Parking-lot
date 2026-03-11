@@ -1,0 +1,33 @@
+# Environment
+.env
+
+# Database
+*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+
+
+# CSV logs
+*.csv
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+
+
+raw/
+*.mp4
+*.mkv
+.coverage

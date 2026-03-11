@@ -1,0 +1,18 @@
+# Core
+fastapi>=0.135.1
+uvicorn>=0.41.0
+pydantic-settings>=2.13.1
+
+# Detection & OCR
+ultralytics>=8.4.19
+paddleocr>=3.4.0
+paddlepaddle>=3.0
+
+# Video/Image
+opencv-python-headless>=4.13.0.92
+
+# Database
+sqlmodel>=0.0.37
+
+# Logging
+structlog>=25.5.0
