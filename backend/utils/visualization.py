@@ -32,8 +32,11 @@ def draw_annotations(
         # Bounding box
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
 
-        # Label: "ClassName: TEXT (0.95)"
-        label = f"{ann.class_name}: {ann.text} ({ann.confidence:.2f})"
+        # Label: "ClassName: TEXT (0.95)" or "ClassName (det 0.85)" when OCR failed
+        if ann.text:
+            label = f"{ann.class_name}: {ann.text} ({ann.confidence:.2f})"
+        else:
+            label = f"{ann.class_name} (det {ann.confidence:.2f})"
 
         # Background rectangle for readability
         (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)

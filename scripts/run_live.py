@@ -48,6 +48,8 @@ def main():
     parser.add_argument("--no-motion", action="store_true", help="Disable motion detection filter")
     parser.add_argument("--display", action="store_true", help="Show live OpenCV window with annotations")
     parser.add_argument("--output", default=None, metavar="PATH", help="Write annotated video to file (e.g. output.mp4)")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Suppress per-frame detection logs and gate event output")
+    parser.add_argument("--no-banner", action="store_true", help="Hide decision banners (APPROVED/DENIED/FLAGGED) from display/video")
     parser.add_argument(
         "--allow", action="append", default=[], metavar="TYPE:VALUE",
         help="Seed allowlist entry, e.g. --allow USDOT:1234567",
@@ -94,6 +96,8 @@ def main():
         csv_path=args.csv,
         display=args.display,
         output_path=args.output,
+        quiet=args.quiet,
+        show_banner=not args.no_banner,
     )
 
     quit_hint = " Press Q to quit." if args.display else " Press Ctrl+C to stop."

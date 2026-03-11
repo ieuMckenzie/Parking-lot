@@ -29,12 +29,13 @@ class OCREngine:
         )
         log.info("ocr_loaded", det_model=det_model, rec_model=rec_model)
 
-    def recognize(self, crop: np.ndarray, preprocess: bool = True) -> tuple[str, float]:
+    def recognize(self, crop: np.ndarray, preprocess: bool = True, min_confidence: float | None = None) -> tuple[str, float]:
         """Run full OCR pipeline on a crop. Returns (text, confidence).
 
         The preprocess parameter is accepted for backward compatibility but is
         a no-op — PP-OCRv5 handles its own preprocessing internally.
         """
+        threshold = min_confidence if min_confidence is not None else self.min_confidence
         output = self.model.predict(input=crop)
 
         texts: list[str] = []
@@ -44,7 +45,7 @@ class OCREngine:
             rec_texts = res["rec_texts"]
             rec_scores = res["rec_scores"]
             for text, score in zip(rec_texts, rec_scores):
-                if score >= self.min_confidence and text.strip():
+                if score >= threshold and text.strip():
                     texts.append(text.strip())
                     scores.append(score)
 

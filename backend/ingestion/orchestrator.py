@@ -35,6 +35,8 @@ class GateOrchestrator:
         processing_fps: float = 10.0,
         display: bool = False,
         output_path: str | None = None,
+        quiet: bool = False,
+        show_banner: bool = True,
     ):
         self._cameras = cameras
         self._detector = detector
@@ -47,6 +49,8 @@ class GateOrchestrator:
         self._display = display
         self._output_path = output_path
         self._video_writer: cv2.VideoWriter | None = None
+        self._quiet = quiet
+        self._show_banner = show_banner
 
         self._motion_detectors: dict[str, MotionDetector] = {}
         if use_motion:
@@ -142,8 +146,9 @@ class GateOrchestrator:
             if all_reads:
                 if self._csv_path:
                     append_reads(self._csv_path, all_reads)
-                log.info("reads", count=len(all_reads),
-                         texts=[f"{r.class_name}={r.text}" for r in all_reads])
+                if not self._quiet:
+                    log.info("reads", count=len(all_reads),
+                             texts=[f"{r.class_name}={r.text}" for r in all_reads])
 
             result = self._track_manager.update(all_reads, now=now)
             decision_text = None
@@ -166,7 +171,7 @@ class GateOrchestrator:
                 active_track = self._track_manager.active_track
                 track_reads = len(active_track.reads) if active_track else 0
 
-                banner = self._last_decision if time.monotonic() < self._decision_expire else None
+                banner = self._last_decision if self._show_banner and time.monotonic() < self._decision_expire else None
 
                 annotated = draw_annotations(display_frame, all_annotations)
                 annotated = draw_status(
@@ -216,6 +221,8 @@ class GateOrchestrator:
                  tracks_completed=len(self._track_manager.completed))
 
     def _print_event(self, event, final: bool = False) -> None:
+        if self._quiet:
+            return
         label = "GATE EVENT (final flush)" if final else "GATE EVENT"
         print(f"\n  === {label} ===")
         print(f"  Decision: {event.decision.value}")

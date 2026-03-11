@@ -36,6 +36,7 @@ class OCRConfig(BaseSettings):
     small_crop_padding: float = Field(default=0.5, description="Extra padding for small detections (< 150px)")
     small_crop_threshold: int = Field(default=150, description="Detections smaller than this (pixels) get extra padding")
     min_confidence: float = Field(default=0.5, description="Minimum OCR confidence to accept a text line")
+    container_min_confidence: float = Field(default=0.3, description="Lower OCR confidence threshold for container numbers")
 
 
 class FusionConfig(BaseSettings):

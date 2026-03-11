@@ -1,3 +1,5 @@
+import csv
+
 import numpy as np
 from unittest.mock import MagicMock
 from sqlmodel import SQLModel, Session, create_engine
@@ -62,7 +64,7 @@ class FakeOCR:
         self._text = text
         self._conf = confidence
 
-    def recognize(self, crop, preprocess=True):
+    def recognize(self, crop, preprocess=True, min_confidence=None):
         return self._text, self._conf
 
 
@@ -203,3 +205,111 @@ class TestGateOrchestrator:
 
         # Should have stopped before processing all 1000 frames
         assert cam._index < 1000
+
+    def test_csv_logging_writes_reads(self, tmp_path):
+        from backend.ingestion.orchestrator import GateOrchestrator
+
+        csv_path = tmp_path / "detections.csv"
+
+        cam = FakeCamera(
+            frames=[(_frame(100), 0.0), (_frame(110), 1.0), (_frame(120), 2.0)],
+            camera_id="cam0",
+        )
+        detector = FakeDetector([
+            FakeDetection("USDOT", (100, 100, 200, 150), 0.9),
+        ])
+        ocr = FakeOCR("1234567", 0.92)
+        session = _make_session()
+        tm = TrackManager(timeout=5.0)
+
+        orch = GateOrchestrator(
+            cameras=[cam],
+            detector=detector,
+            ocr=ocr,
+            track_manager=tm,
+            session=session,
+            use_motion=False,
+            csv_path=str(csv_path),
+        )
+        orch.start()
+
+        assert csv_path.exists(), "CSV file should have been created"
+
+        with open(csv_path) as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        # 3 frames × 1 detection each = 3 CSV rows
+        assert len(rows) == 3
+        for row in rows:
+            assert row["Value"] == "1234567"
+            assert row["Data_Type"] == "usdot"
+            assert row["Camera_ID"] == "cam0"
+            assert float(row["Confidence"]) > 0
+
+    def test_csv_logging_not_created_without_flag(self, tmp_path):
+        from backend.ingestion.orchestrator import GateOrchestrator
+
+        csv_path = tmp_path / "should_not_exist.csv"
+
+        cam = FakeCamera(
+            frames=[(_frame(100), 0.0)],
+            camera_id="cam0",
+        )
+        detector = FakeDetector([
+            FakeDetection("USDOT", (100, 100, 200, 150), 0.9),
+        ])
+        ocr = FakeOCR("1234567", 0.92)
+        session = _make_session()
+        tm = TrackManager(timeout=5.0)
+
+        orch = GateOrchestrator(
+            cameras=[cam],
+            detector=detector,
+            ocr=ocr,
+            track_manager=tm,
+            session=session,
+            use_motion=False,
+            csv_path=None,
+        )
+        orch.start()
+
+        assert not csv_path.exists(), "CSV should not be created when csv_path is None"
+
+    def test_csv_logging_multiple_classes(self, tmp_path):
+        from backend.ingestion.orchestrator import GateOrchestrator
+
+        csv_path = tmp_path / "multi.csv"
+
+        cam = FakeCamera(
+            frames=[(_frame(100), 0.0), (_frame(110), 1.0), (_frame(120), 2.0)],
+            camera_id="cam0",
+        )
+        detector = FakeDetector([
+            FakeDetection("USDOT", (100, 100, 200, 150), 0.9),
+            FakeDetection("LicensePlate", (300, 200, 400, 250), 0.85),
+        ])
+        ocr = FakeOCR("ABC1234", 0.88)
+        session = _make_session()
+        tm = TrackManager(timeout=5.0)
+
+        orch = GateOrchestrator(
+            cameras=[cam],
+            detector=detector,
+            ocr=ocr,
+            track_manager=tm,
+            session=session,
+            use_motion=False,
+            csv_path=str(csv_path),
+        )
+        orch.start()
+
+        with open(csv_path) as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        # 3 frames × 2 detections each = 6 rows (some may be filtered by postprocess)
+        assert len(rows) >= 3  # at least plates should pass
+        data_types = {row["Data_Type"] for row in rows}
+        # "ABC1234" passes plate validation but not USDOT (needs 5-8 digits)
+        assert "licenseplate" in data_types

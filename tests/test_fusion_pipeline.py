@@ -32,7 +32,7 @@ class FakeOCR:
         self._results = results
         self._call_idx = 0
 
-    def recognize(self, crop, preprocess=True):
+    def recognize(self, crop, preprocess=True, min_confidence=None):
         keys = list(self._results.keys())
         if self._call_idx < len(keys):
             key = keys[self._call_idx]
