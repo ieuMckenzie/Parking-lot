@@ -1,6 +1,8 @@
-# GateVision
+# Truck ID Scanner
 
 Automated truck gate identification system using computer vision. Reads license plates, USDOT numbers, and trailer numbers from trucks arriving at a facility gate using overlapping cameras, then makes access decisions by cross-referencing against an allowlist.
+
+
 
 ## Setup
 
